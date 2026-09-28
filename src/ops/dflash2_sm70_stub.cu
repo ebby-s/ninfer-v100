@@ -9,6 +9,7 @@
 // which only happens under `--spec dflash2`.
 
 #include "ops/context_kv_materialize/launch.h"
+#include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
 #include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_kernels.h"
 #include "ops/linear/w8/w8_feature.h"
@@ -37,6 +38,12 @@ void w8_dynamic_grouped_conv_add_materialized_launch(W8DynamicConvAddSchedule, c
                                                      const Weight&, const Tensor&, const Tensor&,
                                                      Tensor&, Tensor&, cudaStream_t) {
     unported("w8_dynamic_grouped_conv_add_materialized");
+}
+void candidate_selector_path_launch(SelectorRoute, const Tensor&, const Tensor&, const Tensor&,
+                                    const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                    const SamplingConfig*, Tensor&, Tensor&,
+                                    const SelectorWorkspace&, cudaStream_t) {
+    unported("candidate_selector_path");
 }
 void context_kv_materialize_launch(
     const Tensor&, const Tensor&, const Tensor&, const Tensor&,
