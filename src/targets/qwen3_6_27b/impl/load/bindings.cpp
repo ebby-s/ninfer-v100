@@ -575,12 +575,47 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     return load_plan;
 }
 
-LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
+LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                                 PipelineContext* pipeline)
     : backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
+
+    if (pipeline != nullptr && pipeline->embedding_replica()) {
+        // Publish the token-embedding replica onto every non-primary stage: speculative decoding
+        // gathers draft-token embeddings locally instead of crossing the pipeline each step.
+        const Weight embedding = materialized_weight(backing, plan.token_embedding, 248320, 5120,
+                                                     /*prepack_for_qpn=*/false);
+        const std::size_t bytes     = static_cast<std::size_t>(embedding.payload_bytes);
+        const std::size_t chunk     = 32ULL << 20;
+        DeviceContext& source_stage = pipeline->stage_device(0);
+        PinnedHostBuffer staging(chunk);
+        pipeline->set_embedding_replica_bytes(bytes);
+        for (int stage = 1; stage < pipeline->stage_count(); ++stage) {
+            DeviceContext& destination = pipeline->stage_device(stage);
+            destination.bind_to_current_thread();
+            DeviceBuffer replica(bytes);
+            for (std::size_t offset = 0; offset < bytes; offset += chunk) {
+                const std::size_t amount = std::min(chunk, bytes - offset);
+                source_stage.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(staging.data(),
+                                           static_cast<const std::byte*>(embedding.payload) +
+                                               offset,
+                                           amount, cudaMemcpyDeviceToHost,
+                                           source_stage.transfer_stream));
+                CUDA_CHECK(cudaStreamSynchronize(source_stage.transfer_stream));
+                destination.bind_to_current_thread();
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(replica.p) + offset,
+                                           staging.data(), amount, cudaMemcpyHostToDevice,
+                                           destination.transfer_stream));
+                CUDA_CHECK(cudaStreamSynchronize(destination.transfer_stream));
+            }
+            pipeline->publish_embedding_replica(stage, std::move(replica));
+        }
+    }
+
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
     auto& gdn_layers      = runtime.gdn_layers;

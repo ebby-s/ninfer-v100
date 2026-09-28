@@ -12,6 +12,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+class PipelineContext;
 
 namespace artifact {
 class Binder;
@@ -124,10 +125,14 @@ struct Package {
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
+    // Text backbone topology for pipeline placement: layer count and full-attention interval.
+    static constexpr int kTextLayerCount        = 64;
+    static constexpr int kFullAttentionInterval = 4;
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
-    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
+    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                           PipelineContext* pipeline = nullptr);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model,
                                                 const EngineOptions& options);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,

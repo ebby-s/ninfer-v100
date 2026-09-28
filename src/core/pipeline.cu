@@ -89,6 +89,34 @@ void PipelineStagePartition::require_stage(int stage) const {
     if (stage < 0 || stage >= stages) { pipeline_error("stage out of range"); }
 }
 
+PipelineContext::PipelineContext(std::vector<int> device_ids, int layer_count,
+                                 int full_attention_interval, bool embedding_replica)
+    : group_(std::move(device_ids)),
+      partition_(PipelineStagePartition::make(layer_count, full_attention_interval,
+                                              static_cast<int>(group_.size()))),
+      embedding_replica_(embedding_replica) {
+    group_.require_uniform_compute_capability();
+    if (embedding_replica_ && partition_.stages < 2) {
+        pipeline_error("embedding replica requires at least two stages");
+    }
+    if (embedding_replica_) { embedding_replicas_.resize(static_cast<std::size_t>(partition_.stages)); }
+}
+
+void* PipelineContext::embedding_replica_ptr(int stage) const {
+    if (!embedding_replica_ || stage < 0 || stage >= partition_.stages) { return nullptr; }
+    const DeviceBuffer& buffer =
+        embedding_replicas_[static_cast<std::size_t>(stage)];
+    return buffer.bytes != 0 ? buffer.p : nullptr;
+}
+
+void PipelineContext::publish_embedding_replica(int stage, DeviceBuffer buffer) {
+    if (!embedding_replica_) { pipeline_error("embedding replica is disabled"); }
+    if (stage <= 0 || stage >= partition_.stages) {
+        pipeline_error("embedding replica stage must be a non-primary stage");
+    }
+    embedding_replicas_[static_cast<std::size_t>(stage)] = std::move(buffer);
+}
+
 DeviceGroup::DeviceGroup(std::vector<int> device_ids) {
     if (device_ids.empty()) { pipeline_error("device list is empty"); }
     std::vector<int> sorted = device_ids;

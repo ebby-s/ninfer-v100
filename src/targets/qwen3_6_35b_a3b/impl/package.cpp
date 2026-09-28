@@ -79,10 +79,12 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
 }
 
 std::unique_ptr<Package::LoadedModel>
-Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
+Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                                PipelineContext* pipeline) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
-    auto impl = std::make_unique<LoadedModel::Impl>(
-        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
+    auto impl = std::make_unique<LoadedModel::Impl>(plan.impl_->weights_profile,
+                                                    std::move(plan.impl_->plan.bindings),
+                                                    std::move(materialized), pipeline);
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }

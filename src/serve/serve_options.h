@@ -42,6 +42,11 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
+    // Pipeline parallelism: 1 = single device; stage s owns a contiguous layer range on stage
+    // device s. --pp-devices lists stage ids in stage order (defaults to device..device+N-1).
+    int pipeline_size                      = 1;
+    std::vector<int> pipeline_devices;
+    bool pipeline_embedding_replica        = true;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;

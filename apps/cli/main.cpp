@@ -269,6 +269,9 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
+        engine_options.pipeline_size  = cli.pipeline_size;
+        engine_options.pipeline_devices = cli.pipeline_devices;
+        engine_options.pipeline_embedding_replica = cli.pipeline_embedding_replica;
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;

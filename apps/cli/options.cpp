@@ -79,7 +79,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--pp N] [--pp-devices ID,...] [--pp-no-embed-replica]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft]\n"
@@ -136,6 +136,23 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+        } else if (arg == "--pp") {
+            options.pipeline_size = static_cast<int>(parse_u32(value(arg), "pp"));
+        } else if (arg == "--pp-devices") {
+            options.pipeline_devices.clear();
+            std::string_view remaining(value(arg));
+            while (!remaining.empty()) {
+                const std::size_t comma = remaining.find(',');
+                const std::string_view item =
+                    remaining.substr(0, comma == std::string_view::npos ? remaining.size()
+                                                                        : comma);
+                options.pipeline_devices.push_back(
+                    parse_device(std::string(item).c_str()));
+                if (comma == std::string_view::npos) { break; }
+                remaining.remove_prefix(comma + 1);
+            }
+        } else if (arg == "--pp-no-embed-replica") {
+            options.pipeline_embedding_replica = false;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

@@ -70,6 +70,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--pp N] [--pp-devices ID,...] [--pp-no-embed-replica] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -259,6 +260,28 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--pp") {
+            options.pipeline_size = parse_nonnegative_int(require_value("--pp"), "pp");
+            if (options.pipeline_size == 0) {
+                throw std::invalid_argument("--pp must be positive");
+            }
+        } else if (arg == "--pp-devices") {
+            options.pipeline_devices.clear();
+            const std::string list = require_value("--pp-devices");
+            std::string_view remaining(list);
+            while (!remaining.empty()) {
+                const std::size_t comma = remaining.find(',');
+                const std::string_view item =
+                    remaining.substr(0, comma == std::string_view::npos ? remaining.size()
+                                                                        : comma);
+                const std::string item_text(item);
+                options.pipeline_devices.push_back(
+                    parse_nonnegative_int(item_text.c_str(), "pp-devices"));
+                if (comma == std::string_view::npos) { break; }
+                remaining.remove_prefix(comma + 1);
+            }
+        } else if (arg == "--pp-no-embed-replica") {
+            options.pipeline_embedding_replica = false;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

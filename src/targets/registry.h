@@ -11,6 +11,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+class PipelineContext;
 
 namespace targets {
 
@@ -85,6 +86,9 @@ struct ConstructedTarget {
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     runtime::ContextMachineCostModel context_cost;
+    // Pipeline execution context under pipeline parallelism; null on a single device. Owns the
+    // stage devices, layer partition, and embedding replicas for the Engine lifetime.
+    std::unique_ptr<PipelineContext> pipeline;
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,

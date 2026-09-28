@@ -23,6 +23,9 @@ struct Options {
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
+    int pipeline_size            = 1;
+    std::vector<int> pipeline_devices;
+    bool pipeline_embedding_replica = true;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

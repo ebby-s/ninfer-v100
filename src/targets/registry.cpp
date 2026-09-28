@@ -4,12 +4,15 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/pipeline.h"
 #include "core/startup.h"
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/context_cost.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -84,6 +87,66 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
+// Validates pipeline options and returns the stage device-id list in stage order; empty means
+// pipeline parallelism is disabled (single device).
+std::vector<int> pipeline_stage_devices(const EngineOptions& options) {
+    if (options.pipeline_size == 1) {
+        if (!options.pipeline_devices.empty()) {
+            throw std::invalid_argument(
+                "Engine pipeline_devices must be empty when pipeline_size is 1");
+        }
+        return {};
+    }
+    if (options.pipeline_size < 1 || options.pipeline_size > 16) {
+        throw std::invalid_argument("Engine pipeline_size must be in [1,16]");
+    }
+    std::vector<int> devices = options.pipeline_devices;
+    if (devices.empty()) {
+        devices.reserve(static_cast<std::size_t>(options.pipeline_size));
+        for (int stage = 0; stage < options.pipeline_size; ++stage) {
+            devices.push_back(options.device + stage);
+        }
+    }
+    if (static_cast<int>(devices.size()) != options.pipeline_size) {
+        throw std::invalid_argument(
+            "Engine pipeline_devices must name exactly pipeline_size devices");
+    }
+    if (devices.front() != options.device) {
+        throw std::invalid_argument(
+            "Engine pipeline_devices must begin with the primary device");
+    }
+    return devices;
+}
+
+// Maps an artifact object name to the pipeline stage that owns its device bytes, following the
+// registered text-backbone naming convention: text/layers/<L>/... follow the layer partition;
+// endpoints and speculative heads live on the last stage; embeddings and vision live on stage 0.
+[[nodiscard]] int stage_of_object_name(const PipelineContext& pipeline,
+                                       std::string_view name) {
+    const int last_stage = pipeline.stage_count() - 1;
+    constexpr std::string_view kLayerPrefix = "text/layers/";
+    if (name.starts_with(kLayerPrefix)) {
+        const std::size_t digits_begin = kLayerPrefix.size();
+        const std::size_t slash        = name.find('/', digits_begin);
+        if (slash != std::string_view::npos) {
+            const std::string_view digits = name.substr(digits_begin, slash - digits_begin);
+            if (!digits.empty() &&
+                std::all_of(digits.begin(), digits.end(),
+                            [](char c) { return c >= '0' && c <= '9'; })) {
+                const int layer = std::stoi(std::string(digits));
+                if (layer < pipeline.partition().layer_count) {
+                    return pipeline.partition().stage_of_layer(layer);
+                }
+            }
+        }
+    }
+    if (name == "text/final_norm" || name == "text/output_head" || name == "text/draft_head" ||
+        name == "text/draft_head_token_ids" || name.starts_with("mtp/")) {
+        return last_stage;
+    }
+    return 0;
+}
+
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
@@ -101,6 +164,16 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     runtime::ResolvedContextMachineCost context_cost = runtime::resolve_context_machine_cost(
         context_cost_identity, options.context_cost.preset_path);
 
+    // Pipeline parallelism: one DeviceContext per stage over the target's text backbone
+    // topology; a null pipeline means the historical single-device load.
+    std::optional<PipelineContext> pipeline;
+    const std::vector<int> stage_devices = pipeline_stage_devices(options);
+    if (!stage_devices.empty()) {
+        pipeline.emplace(stage_devices, Target::kTextLayerCount, Target::kFullAttentionInterval,
+                         options.pipeline_embedding_replica);
+    }
+    PipelineContext* pipeline_ptr = pipeline.has_value() ? &pipeline.value() : nullptr;
+
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
@@ -110,12 +183,19 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
     target_plan_phase.complete();
 
-    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
-                                              &options.startup_observer);
+    auto materialized = artifact::materialize(
+        reader, load_plan.materialization(), device, &options.startup_observer,
+        [pipeline_ptr](const artifact::ObjectDescriptor& object) {
+            return stage_of_object_name(*pipeline_ptr, artifact::object_name(object));
+        },
+        [pipeline_ptr](int stage) -> DeviceContext& {
+            return pipeline_ptr->stage_device(stage);
+        });
     const artifact::MaterializationStats stats = materialized.stats();
 
     StartupPhaseScope target_finalize_phase(options.startup_observer, StartupPhase::TargetFinalize);
-    auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    auto model =
+        Target::construct_loaded_model(std::move(load_plan), std::move(materialized), pipeline_ptr);
     device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
         runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
@@ -153,7 +233,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults,
-                             .context_cost      = std::move(context_cost.model)};
+                             .context_cost      = std::move(context_cost.model),
+                             .pipeline          = pipeline.has_value()
+                                                      ? std::make_unique<PipelineContext>(
+                                                            std::move(pipeline.value()))
+                                                      : nullptr};
 }
 
 } // namespace

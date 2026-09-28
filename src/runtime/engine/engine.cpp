@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/pipeline.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
@@ -231,6 +232,7 @@ public:
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
+        pipeline          = std::move(constructed.pipeline);
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         core = std::visit(
             [&](auto& target_ptr) -> Core {
@@ -264,6 +266,7 @@ public:
 
     EngineOptions options;
     DeviceContext device;
+    std::unique_ptr<PipelineContext> pipeline;
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;

@@ -152,6 +152,14 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // Pipeline parallelism: 1 runs the whole model on `device`. Stage s owns a contiguous layer
+    // range on pipeline_devices[s] (or on consecutive ids from `device` when the list is empty);
+    // stage 0 is the primary Engine device and keeps every single-device behavior.
+    int pipeline_size                  = 1;
+    std::vector<int> pipeline_devices;
+    // Replicates the token-embedding table onto every non-primary stage so speculative decoding
+    // gathers draft-token embeddings locally; disable to reclaim its bytes on the last stage.
+    bool pipeline_embedding_replica    = true;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;

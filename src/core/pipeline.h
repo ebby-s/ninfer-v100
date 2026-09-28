@@ -19,8 +19,8 @@ namespace ninfer {
 // KV payload bytes; GDN layers fill the remaining range. With one stage the partition is the
 // identity over [0, layer_count).
 struct PipelineStagePartition {
-    int stages                 = 1;
-    int layer_count            = 0;
+    int stages                  = 1;
+    int layer_count             = 0;
     int full_attention_interval = 4;
     // Boundary table of size stages + 1: stage s owns global layers [first_layer(s),
     // first_layer(s + 1)). full_ordinals[s] is the global full-attention ordinal of the first
@@ -34,8 +34,7 @@ struct PipelineStagePartition {
     [[nodiscard]] int stage_of_layer(int layer) const;
     [[nodiscard]] int first_layer(int stage) const;
     [[nodiscard]] int layers_in_stage(int stage) const;
-    // Global full-attention-layer ordinal of the first full-attention layer owned by `stage`;
-    // stages without a full-attention layer return the count of full layers before them.
+    // Global full-attention-layer ordinal of the first full-attention layer owned by `stage`.
     [[nodiscard]] int full_attention_base(int stage) const;
     [[nodiscard]] int full_attention_count(int stage) const;
     [[nodiscard]] int gdn_count(int stage) const;
@@ -63,6 +62,43 @@ public:
 
 private:
     std::vector<std::unique_ptr<DeviceContext>> contexts_;
+};
+
+// Whole-model pipeline execution context: the stage devices plus the layer partition. Code that
+// is unaware of pipelines never sees this type; a null PipelineContext means single-stage
+// execution on one device whose DeviceContext is the group's primary stage.
+class PipelineContext {
+public:
+    // `device_ids` are stage-ordered; every id must be distinct and valid. The first entry is the
+    // Engine's primary device and keeps its existing meaning for all single-device code paths.
+    PipelineContext(std::vector<int> device_ids, int layer_count, int full_attention_interval,
+                    bool embedding_replica);
+
+    [[nodiscard]] const PipelineStagePartition& partition() const noexcept { return partition_; }
+    [[nodiscard]] DeviceGroup& group() noexcept { return group_; }
+    [[nodiscard]] const DeviceGroup& group() const noexcept { return group_; }
+    [[nodiscard]] int stage_count() const noexcept { return group_.size(); }
+    [[nodiscard]] DeviceContext& stage_device(int stage) { return group_.at(stage); }
+    // Embedding replicas live on every non-primary stage when enabled: speculative decoding on
+    // the last stage gathers draft-token embeddings locally instead of round-tripping the
+    // primary device every draft step.
+    [[nodiscard]] bool embedding_replica() const noexcept { return embedding_replica_; }
+    [[nodiscard]] std::size_t embedding_replica_bytes() const noexcept {
+        return embedding_replica_ ? embedding_replica_bytes_ : 0;
+    }
+    void set_embedding_replica_bytes(std::size_t bytes) { embedding_replica_bytes_ = bytes; }
+    // Device pointer holding the embedding-table replica on `stage`; null when the stage holds
+    // no replica (the primary stage uses the model's own embedding tensor).
+    [[nodiscard]] void* embedding_replica_ptr(int stage) const;
+
+    void publish_embedding_replica(int stage, DeviceBuffer buffer);
+
+private:
+    DeviceGroup group_;
+    PipelineStagePartition partition_;
+    bool embedding_replica_              = false;
+    std::size_t embedding_replica_bytes_ = 0;
+    std::vector<DeviceBuffer> embedding_replicas_; // per stage; empty where no replica is held
 };
 
 // One inter-stage activation channel. Copies traverse device -> pinned host -> device. All

@@ -7,6 +7,7 @@
 #include <ninfer/targets/qwen3_6/vision.h>
 
 #include "artifact/binder.h"
+#include "core/pipeline.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -138,7 +139,8 @@ using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
 
 class LoadedModelData {
 public:
-    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                    PipelineContext* pipeline = nullptr);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
@@ -153,8 +155,9 @@ public:
 class LoadedModel::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+         artifact::MaterializedArtifact materialized, PipelineContext* pipeline = nullptr)
+        : weights_profile(weights_profile_in),
+          data(std::move(plan), std::move(materialized), pipeline) {}
 
     WeightsProfile weights_profile;
     LoadedModelData data;
