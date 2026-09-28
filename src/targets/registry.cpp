@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -186,7 +187,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const std::vector<int> stage_devices = pipeline_stage_devices(options);
     if (!stage_devices.empty()) {
         pipeline = std::make_unique<PipelineContext>(
-            stage_devices, Target::kTextLayerCount, Target::kFullAttentionInterval,
+            device, std::vector<int>(stage_devices.begin() + 1, stage_devices.end()),
+            Target::kTextLayerCount, Target::kFullAttentionInterval,
             options.pipeline_embedding_replica);
         // v1 pipeline scope: plain generation with MTP. CUDA Graph decode capture, Vision input,
         // and masked-block speculative decoding cross stage boundaries and are rejected until
@@ -202,6 +204,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                 "pipeline parallelism (--pp) does not support Vision input yet");
         }
     }
+    std::fprintf(stderr, "DBG registry: pipeline_size=%d stage_devices=%zu\n",
+                 options.pipeline_size, stage_devices.size());
     PipelineContext* pipeline_ptr = pipeline.get();
 
     artifact::Binder binder(reader);

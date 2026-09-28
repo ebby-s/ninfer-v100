@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include <cstddef>
 #include <cstdio>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -308,6 +309,14 @@ void TextContext::advance_stage(Tensor& x) {
         Tensor& mirror = stage_control_mirrors_.back();
         pipeline_exec_->forward[active_stage_]->enqueue(sampling_config_, mirror.data,
                                                         mirror.bytes());
+        // The config embeds a device pointer to the stage-0 penalty counts; it has no stage-local
+        // mirror, so null it in the copy - penalties read as zero on non-primary stages.
+        DeviceContext& next_device = pipeline_exec_->stage_device(next);
+        next_device.bind_to_current_thread();
+        CUDA_CHECK(cudaMemsetAsync(
+            reinterpret_cast<std::byte*>(mirror.data) +
+                offsetof(ops::SamplingConfig, token_counts),
+            0, sizeof(std::int32_t*), next_device.stream));
         sampling_config_ = reinterpret_cast<const ops::SamplingConfig*>(mirror.data);
     }
 

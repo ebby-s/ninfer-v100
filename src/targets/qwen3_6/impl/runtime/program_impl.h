@@ -929,7 +929,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             resources.decoder = std::make_unique<qwen3_6::DecoderState>(stage_backing, decoder_layout);
             resources.state_images =
                 std::make_unique<qwen3_6::StateImageDevicePool>(stage_backing, state_layout);
-            resources.workspace = std::make_unique<DeviceArena>(plan.workspace.capacity);
+            // Stage capacity = the primary plan plus the boundary activation and tail mirrors
+            // that share this arena during a chunk.
+            const std::size_t stage_workspace_bytes =
+                plan.workspace.capacity +
+                static_cast<std::size_t>(prefill_chunk) * TextConfig::hidden * 2 +
+                (std::size_t{8} << 20);
+            resources.workspace = std::make_unique<DeviceArena>(stage_workspace_bytes);
             // Content mirrors follow the primary pools transitively: stage 1 mirrors stage 0,
             // stage 2 mirrors stage 1, and every primitive forwards along the chain.
             decoder->text_kv.page_pool().set_mirror(resources.decoder->text_kv.page_pool(),

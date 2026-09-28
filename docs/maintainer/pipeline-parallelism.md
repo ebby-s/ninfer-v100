@@ -64,12 +64,22 @@ ordinals, and the decode/prefill tails compute final norm + lm_head + sampling o
 and ship outputs back through the backward transport. PP=1 is bit-identical to the historical path
 (verified: greedy outputs unchanged).
 
-OPEN DEFECT: under `--pp 2`, the prefill-finalize `ops::sample` on the last stage faults with an
-async illegal address (`sampling.cu:45`, multiblock partial-topk kernel). All kernel arguments are
-verified stage-local mirrors; prime suspects are the sampler's `layout.bind(workspace)` scratch
-overlapping the mirrors allocated earlier from the same stage arena (no scope isolation), or a
-stale device pointer among the tail operands. Next step: one compute-sanitizer pass over a
-`--pp 2` run to identify the faulting pointer, then fix accordingly.
+RESOLVED: the sampler fault had two stacked causes - the SamplingConfig embeds a device pointer
+to the stage-0 penalty counts (now nulled in the stage-local mirror; penalties are therefore
+inert on non-primary stages), and the boundary transports raced: `DeviceGroup` constructed a
+duplicate stage-0 DeviceContext whose stream differs from the Engine primary's, so boundary
+copies were unordered against stage-0 compute. Stage 0 now references the Engine's own context,
+and each transport records a consumed-side event its source stream waits on before reusing the
+pinned staging area.
+
+Status: `--pp 2` generation runs end-to-end on 2x V100-PCIE-32GB with the qwen3.8-27b nvfp4
+artifact. Verified: greedy outputs are byte-identical to PP=1 across short, creative, and
+multi-chunk (~1.8K-token) prompts; a 262144-token KV capacity that cannot fit one V100 (19.1 GB
+runtime needed, 13.4 GB available) loads and generates on two. Known v1 limitation: sampling
+presence/frequency penalties are inert on non-primary stages (their counts array is stage-0
+resident); reject penalty-bearing requests at the serving layer if exactness under penalties is
+required. Long-context sweep, decode-throughput regression numbers, and per-stage CUDA Graph
+capture remain open work.
 
 `TextContext` gains a trailing `qwen3_6::PipelineExecution*` constructor parameter (defaulted
 null) and members `active_ctx_` (defaults `&ctx_`), `stage_work_` (defaults `&work_`),

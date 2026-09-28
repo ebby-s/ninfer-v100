@@ -47,10 +47,17 @@ private:
 // keeps its existing meaning for every single-device code path.
 class DeviceGroup {
 public:
-    // Device ids in stage order; every id must be distinct and valid.
+    // Device ids in stage order; every id must be distinct and valid. Stage 0 owns fresh
+    // contexts for the given ids.
     explicit DeviceGroup(std::vector<int> device_ids);
+    // Engine-owned primary: stage 0 references the caller's context so every stage-0 kernel and
+    // inter-stage transfer share one stream with the existing single-device code paths.
+    DeviceGroup(DeviceContext& primary, std::vector<int> remaining_ids);
 
-    [[nodiscard]] int size() const noexcept { return static_cast<int>(contexts_.size()); }
+    [[nodiscard]] int size() const noexcept {
+        return primary_ != nullptr ? static_cast<int>(contexts_.size()) + 1
+                                   : static_cast<int>(contexts_.size());
+    }
     [[nodiscard]] DeviceContext& at(int stage);
     [[nodiscard]] const DeviceContext& at(int stage) const;
     [[nodiscard]] DeviceContext& primary() { return at(0); }
@@ -61,7 +68,11 @@ public:
     void require_uniform_compute_capability() const;
 
 private:
-    std::vector<std::unique_ptr<DeviceContext>> contexts_;
+    // Stage 0 aliases the Engine primary (never owned); stages 1.. own their contexts. Both
+    // vectors index stage - 1 / stage respectively.
+    DeviceContext* primary_ = nullptr;
+    std::vector<std::unique_ptr<DeviceContext>> owned_;
+    std::vector<std::unique_ptr<DeviceContext>> contexts_;  // stages 1.., mirrors owned_ for at()
 };
 
 // Whole-model pipeline execution context: the stage devices plus the layer partition. Code that
@@ -69,10 +80,10 @@ private:
 // execution on one device whose DeviceContext is the group's primary stage.
 class PipelineContext {
 public:
-    // `device_ids` are stage-ordered; every id must be distinct and valid. The first entry is the
-    // Engine's primary device and keeps its existing meaning for all single-device code paths.
-    PipelineContext(std::vector<int> device_ids, int layer_count, int full_attention_interval,
-                    bool embedding_replica);
+    // Stage 0 references `primary_device` (the Engine's own context) so boundary transfers share
+    // the stream every stage-0 kernel uses; `remaining_ids` are stage-ordered and distinct.
+    PipelineContext(DeviceContext& primary_device, std::vector<int> remaining_ids,
+                    int layer_count, int full_attention_interval, bool embedding_replica);
 
     [[nodiscard]] const PipelineStagePartition& partition() const noexcept { return partition_; }
     [[nodiscard]] DeviceGroup& group() noexcept { return group_; }
@@ -129,7 +140,9 @@ private:
     const DeviceContext& to_;
     std::size_t capacity_bytes_ = 0;
     PinnedHostBuffer staging_;
-    cudaEvent_t staged_ready_ = nullptr;
+    cudaEvent_t staged_ready_   = nullptr;  // source copy complete
+    cudaEvent_t consumed_ready_ = nullptr;  // staging area fully read by the destination side
+    mutable bool have_consumed_ = false;
 };
 
 } // namespace ninfer

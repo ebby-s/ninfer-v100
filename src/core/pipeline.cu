@@ -1,6 +1,7 @@
 #include "core/pipeline.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 #include <utility>
 
@@ -92,13 +93,16 @@ void PipelineStagePartition::require_stage(int stage) const {
     }
 }
 
-PipelineContext::PipelineContext(std::vector<int> device_ids, int layer_count,
-                                 int full_attention_interval, bool embedding_replica)
-    : group_(std::move(device_ids)),
+PipelineContext::PipelineContext(DeviceContext& primary_device, std::vector<int> remaining_ids,
+                                 int layer_count, int full_attention_interval,
+                                 bool embedding_replica)
+    : group_(primary_device, std::move(remaining_ids)),
       partition_(PipelineStagePartition::make(layer_count, full_attention_interval,
                                               static_cast<int>(group_.size()))),
       embedding_replica_(embedding_replica) {
     group_.require_uniform_compute_capability();
+    std::fprintf(stderr, "DBG PipelineContext: stages=%d remaining=%zu\n", partition_.stages,
+                 remaining_ids.size());
     if (embedding_replica_ && partition_.stages < 2) {
         pipeline_error("embedding replica requires at least two stages");
     }
@@ -133,18 +137,36 @@ DeviceGroup::DeviceGroup(std::vector<int> device_ids) {
     }
 }
 
+DeviceGroup::DeviceGroup(DeviceContext& primary, std::vector<int> remaining_ids) {
+    primary_ = &primary;
+    std::vector<int> sorted = remaining_ids;
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+        pipeline_error("duplicate device id");
+    }
+    owned_.reserve(sorted.size());
+    contexts_.reserve(sorted.size());
+    for (const int id : sorted) {
+        contexts_.push_back(std::make_unique<DeviceContext>(id));
+    }
+}
+
 DeviceContext& DeviceGroup::at(int stage) {
-    if (stage < 0 || stage >= size()) { pipeline_error("stage out of range"); }
-    return *contexts_[static_cast<std::size_t>(stage)];
+    if (stage < 0 || stage >= size()) {
+        pipeline_error("stage out of range (DeviceGroup::at requested " + std::to_string(stage) +
+                       ", size " + std::to_string(size()) + ")");
+    }
+    return stage == 0 ? *primary_ : *contexts_[static_cast<std::size_t>(stage) - 1];
 }
 
 const DeviceContext& DeviceGroup::at(int stage) const {
     if (stage < 0 || stage >= size()) { pipeline_error("stage out of range"); }
-    return *contexts_[static_cast<std::size_t>(stage)];
+    return stage == 0 ? *primary_ : *contexts_[static_cast<std::size_t>(stage) - 1];
 }
 
 void DeviceGroup::require_uniform_compute_capability() const {
-    const int capability = contexts_.front()->compute_capability();
+    const int capability = primary_->compute_capability();
+    if (contexts_.empty()) { return; }
     for (const auto& context : contexts_) {
         if (context->compute_capability() != capability) {
             pipeline_error("pipeline stages mix compute capabilities (" +
@@ -164,13 +186,19 @@ PipelineTransport::PipelineTransport(const DeviceContext& from, const DeviceCont
     if (cudaEventCreateWithFlags(&staged_ready_, cudaEventDisableTiming) != cudaSuccess) {
         pipeline_error("failed to create staging event");
     }
+    // The consumed event is recorded on the destination stream, so it belongs to the destination
+    // device's context.
+    to_.bind_to_current_thread();
+    if (cudaEventCreateWithFlags(&consumed_ready_, cudaEventDisableTiming) != cudaSuccess) {
+        pipeline_error("failed to create consumed event");
+    }
 }
 
 PipelineTransport::~PipelineTransport() {
-    if (staged_ready_ != nullptr) {
-        from_.bind_to_current_thread_noexcept();
-        cudaEventDestroy(staged_ready_);
-    }
+    from_.bind_to_current_thread_noexcept();
+    if (staged_ready_ != nullptr) { cudaEventDestroy(staged_ready_); }
+    to_.bind_to_current_thread_noexcept();
+    if (consumed_ready_ != nullptr) { cudaEventDestroy(consumed_ready_); }
 }
 
 void PipelineTransport::require_capacity(std::size_t bytes) const {
@@ -185,6 +213,9 @@ void PipelineTransport::enqueue(const void* source, void* destination, std::size
     require_capacity(bytes);
 
     from_.bind_to_current_thread();
+    // The staging area is reused across enqueues; the source side must not overwrite it until the
+    // previous destination-side copy has consumed it.
+    if (have_consumed_) { CUDA_CHECK(cudaStreamWaitEvent(from_.stream, consumed_ready_, 0)); }
     if (from_.device == to_.device) {
         // Same-device stages (single-stage and tests): one D2D copy on the source stream.
         CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice,
@@ -203,6 +234,8 @@ void PipelineTransport::enqueue(const void* source, void* destination, std::size
     if (from_.device != to_.device) {
         CUDA_CHECK(cudaMemcpyAsync(destination, staging_.data(), bytes, cudaMemcpyHostToDevice,
                                    to_.stream));
+        CUDA_CHECK(cudaEventRecord(consumed_ready_, to_.stream));
+        have_consumed_ = true;
     }
 }
 
