@@ -28,6 +28,12 @@ prefill chunk).
   capture is disabled for `--pp>1` (eager decode) until per-stage capture lands.
 - `ninfer_pipeline_test` (partition invariants, transport round-trip on one and two devices) and
   the opt-in `ninfer_qwen3_6_27b_pipeline_placement_real_test` (real artifact, two devices).
+- Hardware-verified (2x V100-PCIE-32GB, qwen3.8-27b nvfp4): a `--pp 2` load places ~10.2 GiB on
+  stage 0 and ~11.4 GiB on stage 1 (weight share + embedding replica + last-stage MTP KV) and
+  completes Program startup. Device-context hygiene this exposed: staging-slot events are created
+  per stage device, load-time FP8/NVFP4 QPN prepacks run under a weight-device guard, and
+  construct_target/Engine/Program rebind the primary device after staged work (a leaked
+  current-device state otherwise cudaMallocs the persistent pool on a non-primary stage).
 
 ## Remaining execution work
 
@@ -45,15 +51,23 @@ primary device. Split by stage:
   free VRAM minus its weights and workspaces. KV capacity resolution
   (`runtime::resolve_kv_capacity`) must budget against summed stage free bytes (the preflight in
   `registry.cpp` already does this for weights).
+  Lower-risk alternative that avoids touching SequencePlan: plan the stage>0 decoder/state images
+  locally in `ProgramImplCore` with the existing `plan_decoder_state` /
+  `plan_state_image_device_pool` builders over a stage-local `LayoutBuilder` (same page-group
+  count, stage subset counts), allocate the stage backing from a stage-local arena, and check the
+  stage's free VRAM there.
 - Allocate one persistent `DeviceArena` per stage on its device; construct per-stage
   `DecoderState`/`StateImageDevicePool`. Stage 0 keeps the existing member roles so the
   single-device path is untouched.
-- `LogicalKVPageStore` + `KVAddressSpaceStore` funnel the whole physical page lifecycle
-  (`materialize`, `dematerialize`, `resize_reservation`, `copy_page`, `zero_pages`, `publish`).
-  Add a lockstep stage-1 mirror: identical logical operations drive the stage-1 pool and tables in
-  the same order. Logical addressing stays shared (row indices, page-group identity); physical
-  placement and table contents differ per device. Free-run allocation order is deterministic, so
-  both pools derive identical physical index sequences from the same operation stream.
+- The physical page lifecycle funnels through few sites, which keeps the mirror contained:
+  `LogicalKVPageStore` calls `physical_->materialize_one` (3 sites), `materialize` (1),
+  `dematerialize_one` (3); `KVAddressSpaceStore` owns the execution-table publishes; Program-level
+  `page_pool().copy_page` appears at `program_impl.h` ~5122/5155/8204/8215 (prefix fork/copy
+  paths). Mirror design: each primary `DeviceKVPageLease` gains a parallel mirror lease stored per
+  page (`Page::mirror_replica`, guarded by a `DeviceKVPagePool* mirror_pool_`); both pools
+  allocate in identical deterministic free-run order, so physical indices match and
+  `KVExecutionTablePool::publish` can reuse one host shadow written to both stages' tables
+  (identical row content, per-device backing).
 - `StateImageStore` slot operations (`copy_slot`, `zero_slot`, hidden store) mirror per stage the
   same way; `set_linear_state_slots` in TextContext fans out to both stage pools with local layer
   indices.
@@ -63,6 +77,10 @@ primary device. Split by stage:
 `TextContext` runs all layers on one `ctx_.stream`. Introduce an optional `PipelineContext*` +
 per-stage resources (work arena, text cache, linear pool, transport channel, workspace mirrors):
 
+- The workspace arena is reached through the `work_` member across `text_context_impl.h`; turn it
+  into an `active_work()` indirection (a `WorkspaceArena*` member defaulting to `&work_`) that the
+  stage switch rebinds, so per-layer temporary allocation follows the active stage. The same
+  applies to the `ctx_` stream used by every launcher call.
 - `run_layers` switches stage at the partition boundary: record the source event, transport the
   hidden tensor into the next stage's workspace mirror, continue with that stage's stream, cache
   views, and pools. Layer-index mapping: full ordinal `f` owns global layer `4f+3`; GDN ordinal
