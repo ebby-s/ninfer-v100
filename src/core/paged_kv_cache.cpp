@@ -555,6 +555,14 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
                                  cudaStream_t stream) const {
     const std::int32_t source_index      = physical_index(source);
     const std::int32_t destination_index = physical_index(destination);
+    copy_physical_page(source_index, destination_index, stream);
+    if (mirror_pool_ != nullptr) {
+        mirror_pool_->copy_physical_page(source_index, destination_index, stream);
+    }
+}
+
+void DeviceKVPagePool::copy_physical_page(std::int32_t source_index, std::int32_t destination_index,
+                                          cudaStream_t stream) const {
     if (source_index == destination_index) { return; }
     for (const Tensor& plane : planes_) {
         auto* base = static_cast<unsigned char*>(plane.data);
@@ -571,6 +579,16 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
                 stream));
         }
     }
+}
+
+void DeviceKVPagePool::set_mirror(DeviceKVPagePool& mirror) {
+    if (mirror.mirror_pool_ != nullptr) {
+        throw std::invalid_argument("Paged KV pool mirror must be single-level");
+    }
+    if (mirror.spec_.page_group_count != spec_.page_group_count) {
+        throw std::invalid_argument("Paged KV pool mirror capacity differs from its primary");
+    }
+    mirror_pool_ = &mirror;
 }
 
 void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
@@ -825,11 +843,35 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
                                            std::uint32_t logical_begin,
                                            std::span<const std::int32_t> indices,
                                            cudaStream_t stream) {
+    write_row_indices(row_handle.row_, logical_begin, indices, stream);
+    if (mirror_tables_ != nullptr) {
+        mirror_tables_->write_row_indices(row_handle.row_, logical_begin, indices, stream);
+    }
+}
+
+void KVExecutionTablePool::write_row_indices(std::int32_t row_index, std::uint32_t logical_begin,
+                                             std::span<const std::int32_t> indices,
+                                             cudaStream_t stream) {
     if (indices.empty()) { return; }
-    Tensor destination_row = row(row_handle);
+    if (row_index < 0 || row_index >= row_count() || logical_begin > logical_page_capacity()) {
+        throw std::invalid_argument("Paged KV mapping publication is outside its execution row");
+    }
+    Tensor destination_row = block_tables_.slice(1, row_index, 1)
+                                 .view({static_cast<std::int32_t>(logical_page_capacity())});
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
     CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
                                cudaMemcpyHostToDevice, stream));
+}
+
+void KVExecutionTablePool::set_mirror(KVExecutionTablePool& mirror) {
+    if (mirror.mirror_tables_ != nullptr) {
+        throw std::invalid_argument("Paged KV execution table mirror must be single-level");
+    }
+    if (mirror.logical_page_capacity() != logical_page_capacity() ||
+        mirror.row_count() != row_count()) {
+        throw std::invalid_argument("Paged KV execution table mirror geometry differs");
+    }
+    mirror_tables_ = &mirror;
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {

@@ -256,7 +256,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     StartupPhaseScope program_phase(options.startup_observer, StartupPhase::ProgramInitialize);
     auto instance =
         std::make_unique<Instance>(std::move(loaded), capacity_resolution, std::move(sequence_plan),
-                                   device, options.startup_observer);
+                                   device, options.startup_observer, pipeline_ptr);
     device.synchronize();
     program_phase.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
@@ -295,11 +295,12 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          DeviceContext& device,
-                                         const StartupObserver& startup_observer)
+                                         const StartupObserver& startup_observer,
+                                         PipelineContext* pipeline)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device,
-                                          startup_observer)) {}
+                                          startup_observer, pipeline)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
@@ -313,11 +314,12 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
                                                runtime::KvCapacityResolution resolution,
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
                                                DeviceContext& device,
-                                               const StartupObserver& startup_observer)
+                                               const StartupObserver& startup_observer,
+                                               PipelineContext* pipeline)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device,
-                                             startup_observer)) {}
+                                             startup_observer, pipeline)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 

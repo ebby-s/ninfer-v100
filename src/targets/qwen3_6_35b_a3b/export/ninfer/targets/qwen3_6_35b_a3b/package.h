@@ -135,7 +135,8 @@ struct Package {
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
-                   const StartupObserver& startup_observer);
+                   const StartupObserver& startup_observer,
+                   PipelineContext* pipeline = nullptr);
 };
 
 } // namespace targets::qwen3_6_35b_a3b

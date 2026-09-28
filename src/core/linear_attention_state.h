@@ -84,9 +84,15 @@ public:
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
     void zero_all(cudaStream_t stream = nullptr);
 
+    // Registers a passive mirror pool that receives every indexed slot mutation this pool applies
+    // (copies, zeroes) at identical slot indices. The mirror owns the stage-local layers of a
+    // pipeline stage; the primary owns slot lifecycle. Single-level mirror only.
+    void set_mirror(LinearAttentionStatePool& mirror);
+
 private:
     std::vector<Tensor> conv_;
     std::vector<Tensor> recurrent_;
+    LinearAttentionStatePool* mirror_pool_ = nullptr;
     LinearAttentionStatePoolSpec spec_;
 };
 

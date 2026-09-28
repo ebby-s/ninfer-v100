@@ -765,7 +765,8 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in, const StartupObserver& startup_observer)
+                                 DeviceContext& device_in, const StartupObserver& startup_observer,
+                                 qwen3_6::PipelineContext* pipeline)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
@@ -864,6 +865,92 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         decoder->text_kv.execution_tables().logical_page_capacity());
     state_images =
         std::make_unique<qwen3_6::StateImageDevicePool>(backing, plan.persistent.state_images);
+    if (pipeline != nullptr && pipeline->stage_count() > 1) {
+        // Non-primary stages plan the same logical capacity with their layer subsets; the
+        // primary pools forward content mutations to them by identical physical indices.
+        pipeline_execution = std::make_unique<qwen3_6::PipelineExecution>();
+        pipeline_execution->context = pipeline;
+        const PipelineStagePartition& partition = pipeline->partition();
+        const std::uint32_t stage_logical_pages = page_count(plan.capacity);
+        const std::int32_t stage_table_rows = static_cast<std::int32_t>(plan.max_concurrency);
+        const std::int32_t stage_state_slots =
+            checked_i32(static_cast<std::uint64_t>(plan.max_concurrency) +
+                            *plan.context_cache.device_state_slots,
+                        "Qwen3.6 pipeline state image slot count exceeds int32");
+        for (int stage = 1; stage < pipeline->stage_count(); ++stage) {
+            qwen3_6::PipelineStageResources resources;
+            DeviceContext& stage_device = pipeline->stage_device(stage);
+            stage_device.bind_to_current_thread();
+            std::size_t free_bytes  = 0;
+            std::size_t total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            LayoutBuilder builder;
+            const qwen3_6::DecoderStateLayout decoder_layout = qwen3_6::plan_decoder_state(
+                builder,
+                qwen3_6::DecoderStateSpec{
+                    .full_attention_layers =
+                        static_cast<std::uint32_t>(partition.full_attention_count(stage)),
+                    .mtp_layers         = 0,
+                    .capacity           = plan.capacity,
+                    .kv_heads           = TextConfig::kv_heads,
+                    .attention_head_dim = TextConfig::head_dim,
+                    .kv_storage         = plan.kv_storage,
+                    .enable_mtp         = false,
+                    .kv_table_rows      = stage_table_rows,
+                    .text_physical_page_groups  = plan.main_page_groups,
+                    .mtp_physical_page_groups   = 0,
+                });
+            const qwen3_6::StateImageDeviceLayout state_layout =
+                qwen3_6::plan_state_image_device_pool(
+                    builder,
+                    qwen3_6::StateImageSpec{
+                        .linear =
+                            {
+                                .layers = static_cast<std::uint32_t>(partition.gdn_count(stage)),
+                                .conv_channels  = TextConfig::convolution_dim,
+                                .conv_width     = TextConfig::gdn_conv_state_width,
+                                .value_heads    = TextConfig::gdn_value_heads,
+                                .value_head_dim = TextConfig::gdn_value_head_dim,
+                                .key_head_dim   = TextConfig::gdn_key_head_dim,
+                                .slot_count     = stage_state_slots,
+                                .conv_dtype     = DType::BF16,
+                            },
+                        .hidden = TextConfig::hidden,
+                    });
+            const std::size_t stage_bytes = builder.finish(256, "pipeline stage persistent");
+            if (stage_bytes > free_bytes) {
+                throw std::overflow_error(
+                    "pipeline stage " + std::to_string(stage) + " requires " +
+                    std::to_string(stage_bytes) + " KV/state bytes, but only " +
+                    std::to_string(free_bytes) + " are free on its device after weights");
+            }
+            resources.persistent = std::make_unique<DeviceArena>(stage_bytes);
+            const DeviceSpan stage_backing{resources.persistent->base(), stage_bytes};
+            resources.decoder = std::make_unique<qwen3_6::DecoderState>(stage_backing, decoder_layout);
+            resources.state_images =
+                std::make_unique<qwen3_6::StateImageDevicePool>(stage_backing, state_layout);
+            resources.workspace = std::make_unique<DeviceArena>(plan.workspace.capacity);
+            // Content mirrors follow the primary pools transitively: stage 1 mirrors stage 0,
+            // stage 2 mirrors stage 1, and every primitive forwards along the chain.
+            decoder->text_kv.page_pool().set_mirror(resources.decoder->text_kv.page_pool());
+            decoder->text_kv.execution_tables().set_mirror(
+                resources.decoder->text_kv.execution_tables());
+            state_images->linear().set_mirror(resources.state_images->linear());
+            pipeline_execution->stages.push_back(std::move(resources));
+        }
+        const std::size_t boundary_bytes =
+            std::max<std::size_t>(static_cast<std::size_t>(prefill_chunk) * TextConfig::hidden * 2,
+                                  std::size_t{32} << 20);
+        for (int boundary = 0; boundary + 1 < pipeline->stage_count(); ++boundary) {
+            pipeline_execution->forward.push_back(std::make_unique<PipelineTransport>(
+                pipeline->stage_device(boundary), pipeline->stage_device(boundary + 1),
+                boundary_bytes));
+            pipeline_execution->backward.push_back(std::make_unique<PipelineTransport>(
+                pipeline->stage_device(boundary + 1), pipeline->stage_device(boundary),
+                boundary_bytes));
+        }
+        device_in.bind_to_current_thread();
+    }
     if (plan.context_cache.host_state_slots != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *

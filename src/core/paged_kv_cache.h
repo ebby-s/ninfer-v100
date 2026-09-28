@@ -231,6 +231,18 @@ public:
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                    cudaStream_t stream = nullptr) const;
 
+    // Copies/zeroes one page group by physical index without handle validation. Pipeline mirror
+    // pools address content by the primary pool's physical indices; their allocation state is
+    // passive and never owns handles.
+    void copy_physical_page(std::int32_t source_index, std::int32_t destination_index,
+                            cudaStream_t stream = nullptr) const;
+
+    // Registers a passive mirror pool that receives every content mutation this pool applies
+    // (page copies and zeroes) addressed by identical physical indices. The mirror never
+    // allocates: the primary owns the page lifecycle, and deterministic allocation keeps physical
+    // indices equal across both pools. A single-level mirror only.
+    void set_mirror(DeviceKVPagePool& mirror);
+
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostKVAllocationConstView source,
@@ -258,6 +270,7 @@ private:
 
     DeviceKVPagePoolSpec spec_;
     std::vector<Tensor> planes_;
+    DeviceKVPagePool* mirror_pool_ = nullptr;
     std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
     std::vector<bool> page_allocated_;
@@ -353,6 +366,11 @@ public:
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 
+    // Registers a passive mirror table pool that receives every row write this pool applies,
+    // addressed by identical row and logical indices. The mirror has no lease lifecycle: the
+    // primary owns row semantics. Single-level mirror only.
+    void set_mirror(KVExecutionTablePool& mirror);
+
 private:
     friend class KVExecutionRowLease;
 
@@ -360,9 +378,12 @@ private:
     bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
     void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
                          std::span<const std::int32_t> indices, cudaStream_t stream);
+    void write_row_indices(std::int32_t row_index, std::uint32_t logical_begin,
+                           std::span<const std::int32_t> indices, cudaStream_t stream);
 
     KVExecutionTableSpec spec_;
     const DeviceKVPagePool* pages_ = nullptr;
+    KVExecutionTablePool* mirror_tables_ = nullptr;
     Tensor block_tables_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;

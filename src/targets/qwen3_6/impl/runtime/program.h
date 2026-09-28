@@ -11,6 +11,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/pipeline_runtime.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -518,7 +519,8 @@ public:
     };
 
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device, const StartupObserver& startup_observer);
+                    DeviceContext& device, const StartupObserver& startup_observer,
+                    qwen3_6::PipelineContext* pipeline = nullptr);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -660,6 +662,7 @@ public:
     std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
+    std::unique_ptr<qwen3_6::PipelineExecution> pipeline_execution;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
