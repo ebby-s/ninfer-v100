@@ -37,62 +37,49 @@ prefill chunk).
 
 ## Remaining execution work
 
-### 1. Per-stage decoder state (KV) and GDN state
+### 1. Per-stage decoder state (KV) and GDN state — LANDED (pools + mirrors)
 
-`ProgramImplCore` plans one `DecoderState` (text KV + optional MTP KV) and one
-`StateImageDevicePool` (GDN linear state + continuation hidden) in the persistent backing on the
-primary device. Split by stage:
+`ProgramImplCore` now builds a `PipelineExecution` (targets/qwen3_6/impl/runtime/
+pipeline_runtime.h) under `--pp>1`: each non-primary stage gets a persistent backing, a workspace
+arena, a passive-mirror `DecoderState` (text KV planes + execution tables at the same logical
+capacity with the stage's layer subsets), and a stage-local `StateImageDevicePool` (GDN linear
+state). The core pools carry single-writer mirror hooks — `DeviceKVPagePool::set_mirror`,
+`KVExecutionTablePool::set_mirror`, `LinearAttentionStatePool::set_mirror` — that forward content
+mutations (page copies, table row writes, slot copies/zeroes) to identical physical indices and
+row ids; deterministic free-run allocation keeps indices equal, so the primary alone owns
+allocation state and the mirrors stay passive. All hooks forward transitively for N-stage chains.
 
-- Extend the persistent layout planning (`layouts_impl.h` `plan_persistent_layout`) to produce one
-  layout per stage with the stage's layer subsets: text KV planes =
-  `partition.full_attention_count(stage)`; state-image linear layers = `partition.gdn_count(stage)`;
-  MTP KV and MTP replay records only on the last stage. Capacity (`page_group_count`) is shared:
-  every stage plans the same logical capacity, and per-stage byte budgets come from that stage's
-  free VRAM minus its weights and workspaces. KV capacity resolution
-  (`runtime::resolve_kv_capacity`) must budget against summed stage free bytes (the preflight in
-  `registry.cpp` already does this for weights).
-  Lower-risk alternative that avoids touching SequencePlan: plan the stage>0 decoder/state images
-  locally in `ProgramImplCore` with the existing `plan_decoder_state` /
-  `plan_state_image_device_pool` builders over a stage-local `LayoutBuilder` (same page-group
-  count, stage subset counts), allocate the stage backing from a stage-local arena, and check the
-  stage's free VRAM there.
-- Allocate one persistent `DeviceArena` per stage on its device; construct per-stage
-  `DecoderState`/`StateImageDevicePool`. Stage 0 keeps the existing member roles so the
-  single-device path is untouched.
-- The physical page lifecycle funnels through few sites, which keeps the mirror contained:
-  `LogicalKVPageStore` calls `physical_->materialize_one` (3 sites), `materialize` (1),
-  `dematerialize_one` (3); `KVAddressSpaceStore` owns the execution-table publishes; Program-level
-  `page_pool().copy_page` appears at `program_impl.h` ~5122/5155/8204/8215 (prefix fork/copy
-  paths). Mirror design: each primary `DeviceKVPageLease` gains a parallel mirror lease stored per
-  page (`Page::mirror_replica`, guarded by a `DeviceKVPagePool* mirror_pool_`); both pools
-  allocate in identical deterministic free-run order, so physical indices match and
-  `KVExecutionTablePool::publish` can reuse one host shadow written to both stages' tables
-  (identical row content, per-device backing).
-- `StateImageStore` slot operations (`copy_slot`, `zero_slot`, hidden store) mirror per stage the
-  same way; `set_linear_state_slots` in TextContext fans out to both stage pools with local layer
-  indices.
+Still open in this area: KV capacity resolution budgets only the primary device's free bytes
+(`registry.cpp` `current_free_device_bytes()`); switch it to `min` across stages minus per-stage
+fixed costs (weights already excluded, embedding replica on the last stage, stage workspaces) so
+`--kv-capacity auto` cannot over-commit a non-primary stage.
 
-### 2. Stage-aware TextContext execution
+### 2. Stage-aware TextContext execution — NEXT (fully specified, not started)
 
-`TextContext` runs all layers on one `ctx_.stream`. Introduce an optional `PipelineContext*` +
-per-stage resources (work arena, text cache, linear pool, transport channel, workspace mirrors):
+`TextContext` gains a trailing `qwen3_6::PipelineExecution*` constructor parameter (defaulted
+null) and members `active_ctx_` (defaults `&ctx_`), `stage_work_` (defaults `&work_`),
+`active_stage_`. The mechanical part is contained in `text_context_impl.h`:
 
-- The workspace arena is reached through the `work_` member across `text_context_impl.h`; turn it
-  into an `active_work()` indirection (a `WorkspaceArena*` member defaulting to `&work_`) that the
-  stage switch rebinds, so per-layer temporary allocation follows the active stage. The same
-  applies to the `ctx_` stream used by every launcher call.
-- `run_layers` switches stage at the partition boundary: record the source event, transport the
-  hidden tensor into the next stage's workspace mirror, continue with that stage's stream, cache
-  views, and pools. Layer-index mapping: full ordinal `f` owns global layer `4f+3`; GDN ordinal
-  `g` owns global layer `4*(g/3) + g%3`; each stage indexes its pools with local ordinals
-  (`f - full_attention_base(stage)`, `g - gdn_base(stage)`).
-- `attn_mix` selects `stage_cache(stage)->batch_layer_view(local_fidx)`; `gdn_mix` selects the
-  stage's linear pool view with its local ordinal.
-- Per-round control tensors (`RoundState io`, positions, kv table rows, valid columns, slot
-  indices, envelope) mirror into stage-1 device buffers at the entry of each public call; they are
-  KB-scale. Outputs (`logits`, hidden egress, sampled tokens) copy back to the caller-provided
-  stage-0 tensors via the transport before returning, so Program's D2H egress mechanics are
-  unchanged.
+- `ctx_.` (20 sites) resolves through `active_ctx_`; `work_` (76 sites, word-boundary —
+  `workspace_recipe` is untouched) through `stage_work_`; the six `state_.` sites inside
+  `gdn_mix` resolve through an `active_linear(global_gidx)` helper returning `{pool, local_layer}`
+  with `local = global - (first_layer(stage) - full_attention_base(stage))`. `attn_mix` selects
+  the stage cache view the same way:
+  `pipeline_execution->stage_decoder(stage).text_kv.batch_layer_view(local_fidx)`.
+- `advance_stage(Tensor& x)` runs at the partition boundary inside `run_layers`: enqueue the
+  forward transport for the hidden tensor into a same-shape stage-local workspace tensor, rebind
+  the caller's view by Tensor assignment (Tensor is a lightweight view), bind the next stage
+  device, reset + adopt its workspace, advance `active_stage_`, and rebind the control mirrors.
+- Per-round control tensors (`cache_positions`, `rope_positions`, `kv_table_rows`,
+  `valid_columns`, linear-state slot tensors) mirror at the entry of each public call via forward
+  transports into stage-local copies; the `active_*` members point at the copies. The envelope is
+  a host struct (`CausalAttentionExecutionEnvelope` is two u32s) and needs no copy.
+- Outputs ship back before returning: `logits` (last-stage lm_head) and any caller-visible hidden
+  go through the backward transport into the caller-provided stage-0 tensors, so Program's
+  scatter/sample/egress mechanics on stage 0 are unchanged. The embedding gather stays on
+  stage 0; final norm and `lm_head` are placed on the last stage already.
+- `advance_stage` must also reset the entering stage's workspace arena per call (nothing
+  cross-call persists there; all long-lived state lives in the pools).
 - Embedding gather stays on stage 0; final norm + `lm_head` + proposal head on the last stage.
 - Prefill flows chunks through stages sequentially; the rewrite-checkpoint hidden is captured on
   the last stage and shipped back like any output.
