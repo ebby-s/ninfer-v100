@@ -254,8 +254,11 @@ void LinearAttentionStatePool::set_mirror(LinearAttentionStatePool& mirror) {
     if (mirror.mirror_pool_ != nullptr) {
         throw std::invalid_argument("Linear attention state mirror must be single-level");
     }
-    if (mirror.layer_count() != layer_count() || mirror.slot_count() != slot_count()) {
-        throw std::invalid_argument("Linear attention state mirror geometry differs");
+    // Layer counts differ by design: each pipeline stage's mirror holds that stage's GDN layers,
+    // and indexed slot mutations apply to whichever layers the receiving pool owns. Slot
+    // geometry must match exactly.
+    if (mirror.slot_count() != slot_count()) {
+        throw std::invalid_argument("Linear attention state mirror slot geometry differs");
     }
     mirror_pool_ = &mirror;
 }

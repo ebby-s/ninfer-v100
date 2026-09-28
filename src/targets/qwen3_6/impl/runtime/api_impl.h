@@ -586,7 +586,7 @@ std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
                         SequencePlan<Variant>&& plan, DeviceContext& device,
                         const StartupObserver& startup_observer,
-                        qwen3_6::PipelineContext* pipeline = nullptr) {
+                        PipelineContext* pipeline) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(

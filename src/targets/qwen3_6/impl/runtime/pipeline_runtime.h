@@ -28,7 +28,7 @@ struct PipelineStageResources {
 
 // Cross-stage activation channel set: one forward and one backward transport per stage boundary.
 struct PipelineExecution {
-    const PipelineContext* context = nullptr;
+    PipelineContext* context = nullptr;
     std::vector<PipelineStageResources> stages;  // entry i serves stage i + 1
     std::vector<std::unique_ptr<PipelineTransport>> forward;   // boundary i: stage i -> i + 1
     std::vector<std::unique_ptr<PipelineTransport>> backward;  // boundary i: stage i + 1 -> stage i

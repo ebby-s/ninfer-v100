@@ -766,7 +766,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in, const StartupObserver& startup_observer,
-                                 qwen3_6::PipelineContext* pipeline)
+                                 PipelineContext* pipeline)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),

@@ -520,7 +520,7 @@ public:
 
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
                     DeviceContext& device, const StartupObserver& startup_observer,
-                    qwen3_6::PipelineContext* pipeline = nullptr);
+                    PipelineContext* pipeline = nullptr);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,

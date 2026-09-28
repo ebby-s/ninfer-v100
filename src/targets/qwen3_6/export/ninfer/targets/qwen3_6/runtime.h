@@ -18,7 +18,14 @@ namespace ninfer {
 struct DeviceContext;
 }
 
+namespace ninfer {
+
+class PipelineContext;
+
+} // namespace ninfer
+
 namespace ninfer::targets::qwen3_6 {
+
 
 namespace detail {
 struct CaptureAssessmentImpl;
@@ -945,7 +952,8 @@ private:
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      DeviceContext&, const StartupObserver&);
+                                                      DeviceContext&, const StartupObserver&,
+                                                      ::ninfer::PipelineContext*);
 };
 
 namespace detail {
@@ -1110,6 +1118,7 @@ template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               DeviceContext& device, const StartupObserver& startup_observer);
+               DeviceContext& device, const StartupObserver& startup_observer,
+               ::ninfer::PipelineContext* pipeline = nullptr);
 
 } // namespace ninfer::targets::qwen3_6
