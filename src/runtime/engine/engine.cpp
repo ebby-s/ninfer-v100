@@ -233,6 +233,7 @@ public:
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
         pipeline          = std::move(constructed.pipeline);
+        device.bind_to_current_thread();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         core = std::visit(
             [&](auto& target_ptr) -> Core {

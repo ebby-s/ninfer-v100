@@ -226,6 +226,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
                                  PipelineContext* pipeline)
     : backing(std::move(materialized)) {
+    // Replica publishing switches the current device; the ModelView binds host-side views only,
+    // and callers must keep the primary device current after construction.
+    int load_previous_device = 0;
+    CUDA_CHECK(cudaGetDevice(&load_previous_device));
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
@@ -402,6 +406,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         target.final_norm = artifact::materialized_tensor(backing, plan.dflash.final_norm,
                                                           NumericFormat::BF16, {2048});
     }
+    CUDA_CHECK(cudaSetDevice(load_previous_device));
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail

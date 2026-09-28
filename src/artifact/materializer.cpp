@@ -39,9 +39,13 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 // event completes.
 class Slot {
 public:
-    explicit Slot(std::size_t bytes, int stream_count) : buffer(bytes) {
-        events_.reserve(static_cast<std::size_t>(stream_count));
-        for (int i = 0; i < stream_count; ++i) {
+    // One event per copy stream; each is created with its stream's device current because CUDA
+    // events live on the creating device's context.
+    explicit Slot(std::size_t bytes, const std::vector<DeviceContext*>& copy_devices)
+        : buffer(bytes) {
+        events_.reserve(copy_devices.size());
+        for (DeviceContext* device : copy_devices) {
+            device->bind_to_current_thread();
             cudaEvent_t event = nullptr;
             CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             events_.push_back(event);
@@ -284,8 +288,13 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     StartupPhaseScope staging_phase(startup, StartupPhase::WeightsStagingPin,
                                     StartupProgressUnit::Bytes, staging_bytes);
     device.bind_to_current_thread();
+    std::vector<DeviceContext*> copy_devices;
+    copy_devices.reserve(static_cast<std::size_t>(stage_count));
+    for (int stage = 0; stage < stage_count; ++stage) {
+        copy_devices.push_back(staged ? &stage_device(stage) : &device);
+    }
     for (std::size_t i = 0; i < slot_count; ++i) {
-        slots.push_back(std::make_unique<Slot>(slot_bytes, stage_count));
+        slots.push_back(std::make_unique<Slot>(slot_bytes, copy_devices));
     }
     staging_phase.complete(staging_bytes, staging_bytes);
     out.stats_.peak_staging_bytes = staging_bytes;

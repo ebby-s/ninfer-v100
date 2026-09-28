@@ -49,6 +49,8 @@ int main() {
     options.max_context     = 2048;
     options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     options.max_concurrency = 1;
+    // v1 pipeline contract: eager decode (per-stage graph capture is deferred).
+    options.use_cuda_graph  = false;
 
     std::size_t stage0_during = 0;
     std::size_t stage1_during = 0;

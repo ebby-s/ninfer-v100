@@ -801,6 +801,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
+    // Every Program allocation and startup transaction owns the primary device; keep the caller's
+    // current device binding irrelevant.
+    device_in.bind_to_current_thread();
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }

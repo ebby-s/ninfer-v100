@@ -103,6 +103,36 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
                       .input_scale_divisor_bits  = input_bits};
 }
 
+// Binds the device owning the weight's bytes for the duration of the call: pipeline placement
+// puts tensor bytes on whichever stage owns the layer, not the primary device. Device-side weight
+// preparation (sm_70 QPN prepacks) must run on that device.
+class WeightDeviceGuard {
+public:
+    explicit WeightDeviceGuard(const void* device_pointer) {
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, device_pointer));
+        CUDA_CHECK(cudaGetDevice(&previous_device_));
+        target_device_ = attributes.device;
+        if (target_device_ != previous_device_) {
+            CUDA_CHECK(cudaSetDevice(target_device_));
+        }
+    }
+
+    ~WeightDeviceGuard() {
+        if (target_device_ != previous_device_) {
+            const cudaError_t restore = cudaSetDevice(previous_device_);
+            if (restore != cudaSuccess) { cudaGetLastError(); }
+        }
+    }
+
+    WeightDeviceGuard(const WeightDeviceGuard&)            = delete;
+    WeightDeviceGuard& operator=(const WeightDeviceGuard&) = delete;
+
+private:
+    int target_device_  = 0;
+    int previous_device_ = 0;
+};
+
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
                            const WeightPlan& plan, std::int32_t rows, std::int32_t columns,
                            bool prepack_for_qpn = true) {
@@ -114,6 +144,7 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
         // kernels. text/token_embedding is read row-major by the embedding gather, so it must
         // keep its checkpoint layout.
         if (prepack_for_qpn && out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            const WeightDeviceGuard guard(out.qdata);
             ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out);
         }
 #else
@@ -185,7 +216,11 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
     if (out.gate_up.qtype == QType::NVFP4) {
+        const WeightDeviceGuard gate_up_guard(out.gate_up.qdata);
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+    }
+    if (out.down.qtype == QType::NVFP4) {
+        const WeightDeviceGuard down_guard(out.down.qdata);
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif
@@ -578,6 +613,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
                                  PipelineContext* pipeline)
     : backing(std::move(materialized)) {
+    // Replica publishing switches the current device; the ModelView binds host-side views only,
+    // and callers must keep the primary device current after construction.
+    int load_previous_device = 0;
+    CUDA_CHECK(cudaGetDevice(&load_previous_device));
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
@@ -764,6 +803,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
                                                                NumericFormat::BF16, {5120});
     }
+    CUDA_CHECK(cudaSetDevice(load_previous_device));
 }
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

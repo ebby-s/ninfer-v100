@@ -232,6 +232,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             return pipeline_ptr->stage_device(stage);
         });
     const artifact::MaterializationStats stats = materialized.stats();
+    // Staged materialization leaves the last stage current; every later Program allocation and
+    // startup transaction owns the primary device.
+    device.bind_to_current_thread();
 
     StartupPhaseScope target_finalize_phase(options.startup_observer, StartupPhase::TargetFinalize);
     auto model =
