@@ -80,6 +80,20 @@ std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
     return free_bytes - static_cast<std::size_t>(weight_bytes);
 }
 
+// Free VRAM summed across the pipeline stage devices; materialize() applies the real per-stage
+// budget checks during placement.
+std::size_t pipeline_free_device_bytes(const std::vector<int>& stage_devices) {
+    std::size_t free_total = 0;
+    for (const int id : stage_devices) {
+        cudaSetDevice(id);
+        std::size_t free_bytes = 0;
+        std::size_t total      = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+        free_total += free_bytes;
+    }
+    return free_total;
+}
+
 std::size_t current_free_device_bytes() {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
@@ -171,6 +185,19 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     if (!stage_devices.empty()) {
         pipeline.emplace(stage_devices, Target::kTextLayerCount, Target::kFullAttentionInterval,
                          options.pipeline_embedding_replica);
+        // v1 pipeline scope: plain generation with MTP. CUDA Graph decode capture, Vision input,
+        // and masked-block speculative decoding cross stage boundaries and are rejected until
+        // their per-stage plumbing lands.
+        if (options.speculative.backend == SpeculativeBackend::DFlash2 ||
+            options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument(
+                "pipeline parallelism (--pp) does not support masked-block speculative decoding; "
+                "use --spec none or --spec mtp");
+        }
+        if (options.enable_vision) {
+            throw std::invalid_argument(
+                "pipeline parallelism (--pp) does not support Vision input yet");
+        }
     }
     PipelineContext* pipeline_ptr = pipeline.has_value() ? &pipeline.value() : nullptr;
 
@@ -178,8 +205,21 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
-    const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
+    std::size_t preflight_runtime_bytes = 0;
+    if (pipeline_ptr) {
+        const std::uint64_t stage_free = pipeline_free_device_bytes(stage_devices);
+        const std::uint64_t weight_bytes = load_plan.materialization().device_capacity_bytes;
+        if (weight_bytes > stage_free) {
+            throw std::invalid_argument(
+                "model weights require " + std::to_string(weight_bytes) +
+                " bytes across the pipeline stage devices, but only " + std::to_string(stage_free) +
+                " bytes are free before loading weights");
+        }
+        preflight_runtime_bytes = static_cast<std::size_t>(stage_free - weight_bytes);
+    } else {
+        preflight_runtime_bytes = runtime_bytes_after_planned_weights(
+            load_plan.materialization().device_capacity_bytes);
+    }
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
     target_plan_phase.complete();
 
