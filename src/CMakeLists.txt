@@ -23,6 +23,7 @@ add_library(ninfer_core STATIC
   core/cyclic_kv_cache.cpp
   core/host_kv_arena.cpp
   core/paged_kv_cache.cpp
+  core/pipeline.cu
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
