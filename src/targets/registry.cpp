@@ -180,11 +180,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     // Pipeline parallelism: one DeviceContext per stage over the target's text backbone
     // topology; a null pipeline means the historical single-device load.
-    std::optional<PipelineContext> pipeline;
+    // Heap-allocated from the start: the Program captures this context by pointer, and the
+    // Engine-owned unique_ptr move must not change the pointee address.
+    std::unique_ptr<PipelineContext> pipeline;
     const std::vector<int> stage_devices = pipeline_stage_devices(options);
     if (!stage_devices.empty()) {
-        pipeline.emplace(stage_devices, Target::kTextLayerCount, Target::kFullAttentionInterval,
-                         options.pipeline_embedding_replica);
+        pipeline = std::make_unique<PipelineContext>(
+            stage_devices, Target::kTextLayerCount, Target::kFullAttentionInterval,
+            options.pipeline_embedding_replica);
         // v1 pipeline scope: plain generation with MTP. CUDA Graph decode capture, Vision input,
         // and masked-block speculative decoding cross stage boundaries and are rejected until
         // their per-stage plumbing lands.
@@ -199,7 +202,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                 "pipeline parallelism (--pp) does not support Vision input yet");
         }
     }
-    PipelineContext* pipeline_ptr = pipeline.has_value() ? &pipeline.value() : nullptr;
+    PipelineContext* pipeline_ptr = pipeline.get();
 
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
@@ -223,14 +226,17 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
     target_plan_phase.complete();
 
-    auto materialized = artifact::materialize(
-        reader, load_plan.materialization(), device, &options.startup_observer,
-        [pipeline_ptr](const artifact::ObjectDescriptor& object) {
-            return stage_of_object_name(*pipeline_ptr, artifact::object_name(object));
-        },
-        [pipeline_ptr](int stage) -> DeviceContext& {
-            return pipeline_ptr->stage_device(stage);
-        });
+    auto materialized = pipeline_ptr != nullptr
+        ? artifact::materialize(
+              reader, load_plan.materialization(), device, &options.startup_observer,
+              [pipeline_ptr](const artifact::ObjectDescriptor& object) {
+                  return stage_of_object_name(*pipeline_ptr, artifact::object_name(object));
+              },
+              [pipeline_ptr](int stage) -> DeviceContext& {
+                  return pipeline_ptr->stage_device(stage);
+              })
+        : artifact::materialize(reader, load_plan.materialization(), device,
+                                &options.startup_observer);
     const artifact::MaterializationStats stats = materialized.stats();
     // Staged materialization leaves the last stage current; every later Program allocation and
     // startup transaction owns the primary device.
@@ -277,10 +283,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults,
                              .context_cost      = std::move(context_cost.model),
-                             .pipeline          = pipeline.has_value()
-                                                      ? std::make_unique<PipelineContext>(
-                                                            std::move(pipeline.value()))
-                                                      : nullptr};
+                             .pipeline          = std::move(pipeline)};
 }
 
 } // namespace

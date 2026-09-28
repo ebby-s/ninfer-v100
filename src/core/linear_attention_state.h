@@ -86,13 +86,16 @@ public:
 
     // Registers a passive mirror pool that receives every indexed slot mutation this pool applies
     // (copies, zeroes) at identical slot indices. The mirror owns the stage-local layers of a
-    // pipeline stage; the primary owns slot lifecycle. Single-level mirror only.
-    void set_mirror(LinearAttentionStatePool& mirror);
+    // pipeline stage; the primary owns slot lifecycle. `mirror_stream` must belong to the mirror's
+    // device - its compute stream, so forwarded mutations order with the mirror-side layer reads
+    // and writes they accompany. Single-level mirror only.
+    void set_mirror(LinearAttentionStatePool& mirror, cudaStream_t mirror_stream);
 
 private:
     std::vector<Tensor> conv_;
     std::vector<Tensor> recurrent_;
     LinearAttentionStatePool* mirror_pool_ = nullptr;
+    cudaStream_t mirror_stream_ = nullptr;
     LinearAttentionStatePoolSpec spec_;
 };
 

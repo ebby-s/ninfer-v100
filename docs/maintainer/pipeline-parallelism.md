@@ -54,7 +54,22 @@ Still open in this area: KV capacity resolution budgets only the primary device'
 fixed costs (weights already excluded, embedding replica on the last stage, stage workspaces) so
 `--kv-capacity auto` cannot over-commit a non-primary stage.
 
-### 2. Stage-aware TextContext execution — NEXT (fully specified, not started)
+### 2. Stage-aware TextContext execution — LANDED (one open defect)
+
+Stage switching is implemented: `advance_stage` transports the hidden activation and mirrors the
+per-round control tensors (positions, KV rows, slot tensors, valid columns, and the device
+sampling-config array) into the entering stage's workspace, `run_layers` switches at the partition
+boundary, `attn_mix`/`gdn_mix` select stage-local cache views and linear pools with local
+ordinals, and the decode/prefill tails compute final norm + lm_head + sampling on the last stage
+and ship outputs back through the backward transport. PP=1 is bit-identical to the historical path
+(verified: greedy outputs unchanged).
+
+OPEN DEFECT: under `--pp 2`, the prefill-finalize `ops::sample` on the last stage faults with an
+async illegal address (`sampling.cu:45`, multiblock partial-topk kernel). All kernel arguments are
+verified stage-local mirrors; prime suspects are the sampler's `layout.bind(workspace)` scratch
+overlapping the mirrors allocated earlier from the same stage arena (no scope isolation), or a
+stale device pointer among the tail operands. Next step: one compute-sanitizer pass over a
+`--pp 2` run to identify the faulting pointer, then fix accordingly.
 
 `TextContext` gains a trailing `qwen3_6::PipelineExecution*` constructor parameter (defaulted
 null) and members `active_ctx_` (defaults `&ctx_`), `stage_work_` (defaults `&work_`),

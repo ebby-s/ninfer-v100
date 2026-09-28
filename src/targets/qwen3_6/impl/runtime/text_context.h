@@ -1,5 +1,6 @@
 #pragma once
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "targets/qwen3_6/impl/runtime/pipeline_runtime.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 
@@ -158,7 +159,8 @@ public:
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
+                qwen3_6::PipelineExecution* pipeline_execution = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -240,6 +242,22 @@ public:
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
 private:
+    // Pipeline stage switching. pipeline_exec_ is null for single-device execution, where every
+    // helper below degrades to the primary stage with zero overhead beyond an untaken branch.
+    struct ActiveLinear {
+        LinearAttentionStatePool* pool = nullptr;
+        std::uint32_t layer            = 0;
+    };
+
+    [[nodiscard]] ActiveLinear active_linear(std::uint32_t global_gidx);
+    [[nodiscard]] const qwen3_6::PagedKVCache* active_text_cache(std::uint32_t global_fidx,
+                                                                 std::uint32_t& local_fidx);
+    // Transports the hidden activation into the next stage's workspace, adopts that stage's
+    // device and workspace, and rebinds the per-round control tensors to stage-local mirrors.
+    void advance_stage(Tensor& x);
+    // Restores stage-0 bindings after a round's tail ops have been enqueued on the last stage.
+    void finish_round();
+
     void bind();
 
     [[nodiscard]] bool mtp_enabled() const noexcept {
@@ -298,6 +316,11 @@ private:
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
+    qwen3_6::PipelineExecution* pipeline_exec_ = nullptr;
+    int active_stage_                          = 0;
+    DeviceContext* active_ctx_                 = nullptr;
+    WorkspaceArena* stage_work_                = nullptr;
+    std::vector<Tensor> stage_control_mirrors_;
     qwen3_6::PagedKVCacheView kv_;
     qwen3_6::PagedKVCacheView mtp_kv_;
     const qwen3_6::PagedKVCache* batch_text_kv_ = nullptr;

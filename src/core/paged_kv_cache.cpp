@@ -557,7 +557,7 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
     const std::int32_t destination_index = physical_index(destination);
     copy_physical_page(source_index, destination_index, stream);
     if (mirror_pool_ != nullptr) {
-        mirror_pool_->copy_physical_page(source_index, destination_index, stream);
+        mirror_pool_->copy_physical_page(source_index, destination_index, mirror_stream_);
     }
 }
 
@@ -581,7 +581,7 @@ void DeviceKVPagePool::copy_physical_page(std::int32_t source_index, std::int32_
     }
 }
 
-void DeviceKVPagePool::set_mirror(DeviceKVPagePool& mirror) {
+void DeviceKVPagePool::set_mirror(DeviceKVPagePool& mirror, cudaStream_t mirror_stream) {
     if (mirror.mirror_pool_ != nullptr) {
         throw std::invalid_argument("Paged KV pool mirror must be single-level");
     }
@@ -589,6 +589,7 @@ void DeviceKVPagePool::set_mirror(DeviceKVPagePool& mirror) {
         throw std::invalid_argument("Paged KV pool mirror capacity differs from its primary");
     }
     mirror_pool_ = &mirror;
+    mirror_stream_ = mirror_stream;
 }
 
 void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
@@ -845,7 +846,7 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
                                            cudaStream_t stream) {
     write_row_indices(row_handle.row_, logical_begin, indices, stream);
     if (mirror_tables_ != nullptr) {
-        mirror_tables_->write_row_indices(row_handle.row_, logical_begin, indices, stream);
+        mirror_tables_->write_row_indices(row_handle.row_, logical_begin, indices, mirror_stream_);
     }
 }
 
@@ -863,7 +864,7 @@ void KVExecutionTablePool::write_row_indices(std::int32_t row_index, std::uint32
                                cudaMemcpyHostToDevice, stream));
 }
 
-void KVExecutionTablePool::set_mirror(KVExecutionTablePool& mirror) {
+void KVExecutionTablePool::set_mirror(KVExecutionTablePool& mirror, cudaStream_t mirror_stream) {
     if (mirror.mirror_tables_ != nullptr) {
         throw std::invalid_argument("Paged KV execution table mirror must be single-level");
     }
@@ -872,6 +873,7 @@ void KVExecutionTablePool::set_mirror(KVExecutionTablePool& mirror) {
         throw std::invalid_argument("Paged KV execution table mirror geometry differs");
     }
     mirror_tables_ = &mirror;
+    mirror_stream_ = mirror_stream;
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {

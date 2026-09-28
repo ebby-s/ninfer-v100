@@ -38,6 +38,8 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // Null on a single device; the model schedule switches stages through it under --pp>1.
+    qwen3_6::PipelineExecution* pipeline_execution = nullptr;
 };
 
 struct PrefillContext {

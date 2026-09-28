@@ -86,7 +86,10 @@ int PipelineStagePartition::gdn_count(int stage) const {
 }
 
 void PipelineStagePartition::require_stage(int stage) const {
-    if (stage < 0 || stage >= stages) { pipeline_error("stage out of range"); }
+    if (stage < 0 || stage >= stages) {
+        pipeline_error("stage out of range (requested " + std::to_string(stage) + ", stages " +
+                       std::to_string(stages) + ", layers " + std::to_string(layer_count) + ")");
+    }
 }
 
 PipelineContext::PipelineContext(std::vector<int> device_ids, int layer_count,

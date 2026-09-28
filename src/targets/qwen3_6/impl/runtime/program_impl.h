@@ -932,10 +932,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             resources.workspace = std::make_unique<DeviceArena>(plan.workspace.capacity);
             // Content mirrors follow the primary pools transitively: stage 1 mirrors stage 0,
             // stage 2 mirrors stage 1, and every primitive forwards along the chain.
-            decoder->text_kv.page_pool().set_mirror(resources.decoder->text_kv.page_pool());
+            decoder->text_kv.page_pool().set_mirror(resources.decoder->text_kv.page_pool(),
+                                                    stage_device.stream);
             decoder->text_kv.execution_tables().set_mirror(
-                resources.decoder->text_kv.execution_tables());
-            state_images->linear().set_mirror(resources.state_images->linear());
+                resources.decoder->text_kv.execution_tables(), stage_device.stream);
+            state_images->linear().set_mirror(resources.state_images->linear(),
+                                              stage_device.stream);
             pipeline_execution->stages.push_back(std::move(resources));
         }
         const std::size_t boundary_bytes =
@@ -1239,7 +1241,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             schedule::PrefillContext schedule_state{
                 {device, model, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
+                 prefill_chunk, proposal_head, pipeline_execution.get()},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -9091,7 +9093,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 schedule::PrefillContext schedule_state{
                     {device, model, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head},
+                     proposal_head, pipeline_execution.get()},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -11278,7 +11280,7 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head, pipeline_execution.get()};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -11598,7 +11600,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, state_images->linear(),
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head, pipeline_execution.get()},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts,
@@ -11657,7 +11659,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         schedule::PrefillContext schedule_state{
             {device, model, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, pipeline_execution.get()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -11982,7 +11984,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                        replay_records ? &*replay_records : nullptr,
                                                        io, prefill_hidden, prefill_chunk,
-                                                       proposal_head},
+                                                       proposal_head, pipeline_execution.get()},
                                                       decoder->text_kv,
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
@@ -12182,7 +12184,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   use_lookup ? &*mtp_lookup_replay_records
                                                              : &*replay_records,
                                                   io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head, pipeline_execution.get()},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  frame,
@@ -12378,7 +12380,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, pipeline_execution.get()},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

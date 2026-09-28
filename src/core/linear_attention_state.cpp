@@ -212,7 +212,7 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
     validate_layer_slot(*this, 0, src, "LinearAttentionStatePool copy_slot source");
     validate_layer_slot(*this, 0, dst, "LinearAttentionStatePool copy_slot destination");
     if (src == dst) { return; }
-    if (mirror_pool_ != nullptr) { mirror_pool_->copy_slot(src, dst, stream); }
+    if (mirror_pool_ != nullptr) { mirror_pool_->copy_slot(src, dst, mirror_stream_); }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor source      = conv_slot(layer, src);
         const Tensor destination = conv_slot(layer, dst);
@@ -229,7 +229,7 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
 
 void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool zero_slot");
-    if (mirror_pool_ != nullptr) { mirror_pool_->zero_slot(slot, stream); }
+    if (mirror_pool_ != nullptr) { mirror_pool_->zero_slot(slot, mirror_stream_); }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor state = conv_slot(layer, slot);
         CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
@@ -241,7 +241,7 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
 }
 
 void LinearAttentionStatePool::zero_all(cudaStream_t stream) {
-    if (mirror_pool_ != nullptr) { mirror_pool_->zero_all(stream); }
+    if (mirror_pool_ != nullptr) { mirror_pool_->zero_all(mirror_stream_); }
     for (const Tensor& state : conv_) {
         CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
     }
@@ -250,7 +250,8 @@ void LinearAttentionStatePool::zero_all(cudaStream_t stream) {
     }
 }
 
-void LinearAttentionStatePool::set_mirror(LinearAttentionStatePool& mirror) {
+void LinearAttentionStatePool::set_mirror(LinearAttentionStatePool& mirror,
+                                          cudaStream_t mirror_stream) {
     if (mirror.mirror_pool_ != nullptr) {
         throw std::invalid_argument("Linear attention state mirror must be single-level");
     }
@@ -261,6 +262,7 @@ void LinearAttentionStatePool::set_mirror(LinearAttentionStatePool& mirror) {
         throw std::invalid_argument("Linear attention state mirror slot geometry differs");
     }
     mirror_pool_ = &mirror;
+    mirror_stream_ = mirror_stream;
 }
 
 } // namespace ninfer

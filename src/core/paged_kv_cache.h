@@ -241,7 +241,7 @@ public:
     // (page copies and zeroes) addressed by identical physical indices. The mirror never
     // allocates: the primary owns the page lifecycle, and deterministic allocation keeps physical
     // indices equal across both pools. A single-level mirror only.
-    void set_mirror(DeviceKVPagePool& mirror);
+    void set_mirror(DeviceKVPagePool& mirror, cudaStream_t mirror_stream = nullptr);
 
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
@@ -271,6 +271,7 @@ private:
     DeviceKVPagePoolSpec spec_;
     std::vector<Tensor> planes_;
     DeviceKVPagePool* mirror_pool_ = nullptr;
+    cudaStream_t mirror_stream_ = nullptr;
     std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
     std::vector<bool> page_allocated_;
@@ -369,7 +370,7 @@ public:
     // Registers a passive mirror table pool that receives every row write this pool applies,
     // addressed by identical row and logical indices. The mirror has no lease lifecycle: the
     // primary owns row semantics. Single-level mirror only.
-    void set_mirror(KVExecutionTablePool& mirror);
+    void set_mirror(KVExecutionTablePool& mirror, cudaStream_t mirror_stream = nullptr);
 
 private:
     friend class KVExecutionRowLease;
@@ -384,6 +385,7 @@ private:
     KVExecutionTableSpec spec_;
     const DeviceKVPagePool* pages_ = nullptr;
     KVExecutionTablePool* mirror_tables_ = nullptr;
+    cudaStream_t mirror_stream_ = nullptr;
     Tensor block_tables_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
