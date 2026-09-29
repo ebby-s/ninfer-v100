@@ -17,7 +17,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <exception>
+#include <vector>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -10363,9 +10365,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 
     const auto tail_started = Clock::now();
     try {
-#include "core/gdn_replay_records.h"
-#include "ninfer/ops/gdn_replay.h"
-#include <ninfer/targets/qwen3_6/decoder_state.h>
+        timing.resume_submit();
+        active_replay_fold.execute(
+            std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()), device.stream);
         if (pipeline_execution != nullptr) {
             // The verify advanced every stage's GDN state through the verified columns; each
             // stage's fold rolls its own layers back to the same accepted prefix.

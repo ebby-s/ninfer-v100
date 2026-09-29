@@ -189,13 +189,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             device, std::vector<int>(stage_devices.begin() + 1, stage_devices.end()),
             Target::kTextLayerCount, Target::kFullAttentionInterval,
             options.pipeline_embedding_replica);
-        // MTP runs on the last stage with stage-local KV, frame, and replay storage but its
-        // multi-round state rollback under pipeline execution still diverges from the reference,
-        // so it stays gated until that is resolved (docs/maintainer/pipeline-parallelism.md).
-        if (options.speculative.backend != SpeculativeBackend::None) {
+        // MTP runs on the last stage with stage-local KV, frame, and replay storage. Masked-block
+        // speculative decoding and Vision still cross stage boundaries without segmentation.
+        if (options.speculative.backend == SpeculativeBackend::DFlash2 ||
+            options.speculative.backend == SpeculativeBackend::DFlash) {
             throw std::invalid_argument(
-                "pipeline parallelism (--pp) does not support speculative decoding yet; "
-                "use --spec none");
+                "pipeline parallelism (--pp) does not support masked-block speculative decoding; "
+                "use --spec none or --spec mtp");
         }
         if (options.enable_vision) {
             throw std::invalid_argument(

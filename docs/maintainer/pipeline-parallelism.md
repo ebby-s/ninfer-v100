@@ -115,7 +115,26 @@ null) and members `active_ctx_` (defaults `&ctx_`), `stage_work_` (defaults `&wo
 - Prefill flows chunks through stages sequentially; the rewrite-checkpoint hidden is captured on
   the last stage and shipped back like any output.
 
-### 3. MTP on the last stage — implemented, one correctness defect open
+### 3. MTP on the last stage — WORKING
+
+The pipeline MTP round runs end to end and is byte-exact against the single-device reference.
+Root cause of the former round-2 divergence: a scripted edit had silently dropped the primary
+GDN accept-fold execution from the settle path, so the primary state was never rolled back and
+the last stage received a wrong boundary hidden. Restoring the fold fixed both the pipeline and
+a latent single-device bug.
+
+Verified on 2x V100-PCIE-32GB with qwen3.8-27b nvfp4 and the deployed profile flags
+(`--kv-dtype int8 --prefill-chunk 2048 --spec mtp --draft-tokens 3 --lm-head-draft`):
+
+- Outputs: byte-identical between PP=1 and PP=2 on short, creative, and 200-token generations
+  (md5-equal), plus a ~2400-token pp2048 prompt.
+- Prefill: 820 tok/s (PP=2) vs 802 tok/s (PP=1) at pp2048 - parity.
+- Decode: 75.3 tok/s (PP=2, MTP rounds eager) vs 80.0 tok/s (PP=1, MTP rounds graphed);
+  acceptance 78.5% vs 88.9% (the prefill draft bridge is skipped under PP, so early-round
+  drafts are rebuilt by verification).
+
+Remaining polish for exact decode parity: per-stage CUDA Graph capture for the MTP round and
+the prefill draft bridge under PP.
 
 LANDS (all gated off at startup for `--pp>1` until the defect below is fixed):
 - Stage-local MTP KV pool + stage decode frame (full `MtpDecodeState` mirror, layout-cloned from

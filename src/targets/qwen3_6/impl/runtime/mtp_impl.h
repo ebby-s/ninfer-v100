@@ -8,10 +8,7 @@
 
 #include <cuda_runtime.h>
 
-#include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
-#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
