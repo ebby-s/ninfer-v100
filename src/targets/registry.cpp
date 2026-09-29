@@ -189,9 +189,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             device, std::vector<int>(stage_devices.begin() + 1, stage_devices.end()),
             Target::kTextLayerCount, Target::kFullAttentionInterval,
             options.pipeline_embedding_replica);
-        // v1 pipeline scope: plain generation. The speculative and Vision paths cross stage
-        // boundaries; their per-stage round segmentation is the open work in
-        // docs/maintainer/pipeline-parallelism.md.
+        // MTP runs on the last stage with stage-local KV, frame, and replay storage but its
+        // multi-round state rollback under pipeline execution still diverges from the reference,
+        // so it stays gated until that is resolved (docs/maintainer/pipeline-parallelism.md).
         if (options.speculative.backend != SpeculativeBackend::None) {
             throw std::invalid_argument(
                 "pipeline parallelism (--pp) does not support speculative decoding yet; "

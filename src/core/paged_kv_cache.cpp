@@ -876,6 +876,14 @@ void KVExecutionTablePool::set_mirror(KVExecutionTablePool& mirror, cudaStream_t
     mirror_stream_ = mirror_stream;
 }
 
+Tensor KVExecutionTablePool::row_by_index(std::int32_t row_index) const {
+    if (row_index < 0 || row_index >= row_count()) {
+        throw std::out_of_range("Paged KV execution row index is out of range");
+    }
+    return block_tables_.slice(1, row_index, 1)
+        .view({static_cast<std::int32_t>(logical_page_capacity())});
+}
+
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {
     if (!valid_handle(handle)) { throw std::invalid_argument("Paged KV execution row is stale"); }
     return block_tables_.slice(1, handle.row_, 1)

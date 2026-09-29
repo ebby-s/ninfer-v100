@@ -119,9 +119,11 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
         records.spec.width,
         rows,
     };
+    // Per-layer blocks launch from the record's own layer count: pipeline stages fold their
+    // GDN layer subsets, and every per-layer address derives from runtime strides.
     const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
                     static_cast<unsigned>(active_rows),
-                    static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
+                    static_cast<unsigned>(records.spec.layers * (kStateDim / kBlockDv)));
     const dim3 block(kWarpSize, kNumWarps, 1);
     recurrent_fold_kernel<Geometry><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
@@ -190,14 +192,14 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
-    if (records.spec.layers == FoldGeometry48x48::kLayers &&
+    if (records.spec.layers <= FoldGeometry48x48::kLayers &&
         records.spec.qk_heads == FoldGeometry48x48::kQkHeads &&
         records.spec.value_heads == FoldGeometry48x48::kValueHeads &&
         records.spec.conv_channels == FoldGeometry48x48::kConvChannels) {
         launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
         return;
     }
-    if (records.spec.layers == FoldGeometry30x32::kLayers &&
+    if (records.spec.layers <= FoldGeometry30x32::kLayers &&
         records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
         records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
         records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {

@@ -924,6 +924,41 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                             },
                         .hidden = TextConfig::hidden,
                     });
+            std::optional<qwen3_6::MtpDecodeStateLayout> stage_mtp_layout;
+            if (stage_mtp) {
+                if (!plan.persistent.round.mtp_decode.has_value()) {
+                    throw std::logic_error("pipeline MTP asks for a stage frame without a "
+                                           "primary MTP decode layout");
+                }
+                const qwen3_6::MtpDecodeStateLayout& source = *plan.persistent.round.mtp_decode;
+                const auto clone = [&](const TensorRegion& region, const char* label) {
+                    return builder.add_tensor(
+                        region.dtype,
+                        {region.shape[0], region.shape[1], region.shape[2], region.shape[3]}, 256,
+                        label);
+                };
+                qwen3_6::MtpDecodeStateLayout layout;
+                layout.ingress = builder.add(sizeof(qwen3_6::MtpDecodeIngress), 256,
+                                             "pipeline MTP mirror ingress");
+                layout.egress = builder.add(sizeof(qwen3_6::MtpDecodeEgress), 256,
+                                            "pipeline MTP mirror egress");
+                layout.verify_ids           = clone(source.verify_ids, "pipeline MTP verify ids");
+                layout.target_positions     = clone(source.target_positions, "pipeline MTP positions");
+                layout.target_argmax        = clone(source.target_argmax, "pipeline MTP argmax");
+                layout.target_logits        = clone(source.target_logits, "pipeline MTP logits");
+                layout.target_hidden        = clone(source.target_hidden, "pipeline MTP hidden");
+                layout.target_continuation_hidden = clone(source.target_continuation_hidden,
+                                                          "pipeline MTP continuation hidden");
+                layout.proposal_logits      = clone(source.proposal_logits, "pipeline MTP proposal");
+                layout.alignment_ids        = clone(source.alignment_ids, "pipeline MTP alignment ids");
+                layout.alignment_hidden     = clone(source.alignment_hidden, "pipeline MTP alignment hidden");
+                layout.ar_hidden            = clone(source.ar_hidden, "pipeline MTP AR hidden");
+                layout.next_hidden          = clone(source.next_hidden, "pipeline MTP next hidden");
+                layout.ar_positions         = clone(source.ar_positions, "pipeline MTP AR positions");
+                layout.ar_rope_positions    = clone(source.ar_rope_positions, "pipeline MTP AR rope");
+                layout.ar_valid_columns     = clone(source.ar_valid_columns, "pipeline MTP AR valid");
+                stage_mtp_layout = layout;
+            }
             std::optional<GdnReplayRecordLayout> stage_replay_layout;
             std::optional<GdnReplayRecordLayout> stage_lookup_layout;
             if (plan.speculative_backend == SpeculativeBackend::Mtp) {
@@ -976,6 +1011,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             if (stage_replay_layout) {
                 resources.replay_records.emplace(stage_backing, *stage_replay_layout);
                 resources.mtp_lookup_replay_records.emplace(stage_backing, *stage_lookup_layout);
+            }
+            if (stage_mtp_layout) {
+                resources.mtp_frame = std::make_unique<qwen3_6::MtpDecodeState>(
+                    stage_backing, *stage_mtp_layout, plan.max_concurrency, plan.draft_window,
+                    plan.draft_window);
+            }
+            if (resources.replay_records.has_value()) {
+                resources.replay_fold.emplace(*resources.replay_records,
+                                              resources.state_images->linear().all_layers_view());
+                resources.mtp_lookup_replay_fold.emplace(
+                    *resources.mtp_lookup_replay_records,
+                    resources.state_images->linear().all_layers_view());
             }
             resources.workspace = std::make_unique<DeviceArena>(stage_workspace_bytes);
             // Content mirrors follow the primary pools transitively: stage 1 mirrors stage 0,
@@ -9152,9 +9199,10 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
                      proposal_head, pipeline_execution.get()},
                     text_kv_view(sequence),
-                    mtp_kv_view(sequence),
+                    pipeline_execution != nullptr ? qwen3_6::PagedKVCacheView()
+                                                  : mtp_kv_view(sequence),
                     decoder->text_kv,
-                    decoder->mtp_cache(),
+                    pipeline_execution != nullptr ? nullptr : decoder->mtp_cache(),
                     dflash ? &*dflash : nullptr,
                     cursor,
                     nullptr,
@@ -10315,9 +10363,26 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 
     const auto tail_started = Clock::now();
     try {
-        timing.resume_submit();
-        active_replay_fold.execute(
-            std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()), device.stream);
+#include "core/gdn_replay_records.h"
+#include "ninfer/ops/gdn_replay.h"
+#include <ninfer/targets/qwen3_6/decoder_state.h>
+        if (pipeline_execution != nullptr) {
+            // The verify advanced every stage's GDN state through the verified columns; each
+            // stage's fold rolls its own layers back to the same accepted prefix.
+            for (int stage = 1; stage < pipeline_execution->stage_count(); ++stage) {
+                qwen3_6::PipelineStageResources& stage_res =
+                    pipeline_execution->stage_resources(stage);
+                if (!stage_res.replay_fold.has_value()) { continue; }
+                DeviceContext& stage_device = pipeline_execution->stage_device(stage);
+                stage_device.bind_to_current_thread();
+                ops::GdnReplayFoldPlan& stage_fold =
+                    lookup_pending ? *stage_res.mtp_lookup_replay_fold : *stage_res.replay_fold;
+                stage_fold.execute(
+                    std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                    stage_device.stream);
+            }
+            device.bind_to_current_thread();
+        }
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -11109,12 +11174,36 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
-    if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend ||
+    const qwen3_6::PagedKVCache* cache = mtp_round_cache();
+    if (cache == nullptr || !sequence.kv || !sequence.kv->backend ||
         !backend_kv_addresses->active(*sequence.kv->backend)) {
         throw std::logic_error("sequence has no active MTP KV execution mapping");
     }
-    return decoder->mtp_cache()->execution_view(
-        backend_kv_addresses->execution_row(*sequence.kv->backend));
+    if (cache != decoder->mtp_cache()) {
+        // Pipeline mirror cache: rows are written by the primary pool's publish path; address the
+        // row by its shared index instead of a primary-pool lease.
+        return cache->execution_view_by_row(backend_kv_addresses->bound_row(*sequence.kv->backend));
+    }
+    return cache->execution_view(backend_kv_addresses->execution_row(*sequence.kv->backend));
+}
+
+qwen3_6::PagedKVCache* ProgramImplCore::mtp_round_cache() noexcept {
+    if (speculative_backend != SpeculativeBackend::Mtp) { return nullptr; }
+    if (pipeline_execution != nullptr && pipeline_execution->stage_count() > 1) {
+        auto& last = pipeline_execution->stage_resources(pipeline_execution->stage_count() - 1);
+        return last.decoder != nullptr ? last.decoder->mtp_cache() : nullptr;
+    }
+    return decoder->mtp_cache();
+}
+
+const qwen3_6::PagedKVCache* ProgramImplCore::mtp_round_cache() const noexcept {
+    if (speculative_backend != SpeculativeBackend::Mtp) { return nullptr; }
+    if (pipeline_execution != nullptr && pipeline_execution->stage_count() > 1) {
+        const auto& last =
+            pipeline_execution->stages[static_cast<std::size_t>(pipeline_execution->stage_count() - 2)];
+        return last.decoder != nullptr ? last.decoder->mtp_cache() : nullptr;
+    }
+    return decoder->mtp_cache();
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -11402,7 +11491,9 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
 
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend == SpeculativeBackend::Mtp && pipeline_execution != nullptr) {
+        // Pipeline MTP rounds run eagerly until their per-stage capture lands.
+    } else if (speculative_backend == SpeculativeBackend::Mtp) {
         const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
         schedule::MtpBatchContext mtp_state{execution_core(&*replay_records),
@@ -11534,7 +11625,7 @@ void ProgramImplCore::prepare_graphs() {
     if (false) {
         instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
     }
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (speculative_backend == SpeculativeBackend::Mtp && pipeline_execution == nullptr) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
         instantiate_graph_family(mtp_lookup_graphs, "MTP lookup", device,
                                  prepare_representative);
@@ -11757,9 +11848,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head, pipeline_execution.get()},
             text_kv_view(sequence),
-            mtp_kv_view(sequence),
+            pipeline_execution != nullptr ? qwen3_6::PagedKVCacheView() : mtp_kv_view(sequence),
             decoder->text_kv,
-            decoder->mtp_cache(),
+            pipeline_execution != nullptr ? nullptr : decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
@@ -12178,7 +12269,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         lookup_drafts{};
     // Long verification is one batch topology: every row must have a useful lookup continuation,
     // and its first five tokens must agree with the learned MTP proposal before the batch opts in.
-    bool use_lookup = true;
+    // The lookup continuation path uses a second decode frame; pipeline v1 stays on the plain
+    // MTP round and rebuilds drafts by verification.
+    bool use_lookup = pipeline_execution == nullptr;
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -12239,7 +12332,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, verify_k, proposal_k, capacity);
-        if (use_cuda_graph) {
+        if (use_cuda_graph && pipeline_execution == nullptr) {
             DecodeGraphProfile& profile =
                 select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
@@ -12301,7 +12394,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   io,
                                                   prefill_hidden, prefill_chunk, proposal_head, pipeline_execution.get()},
                                                  decoder->text_kv,
-                                                 *decoder->mtp_cache(),
+                                                 *mtp_round_cache(),
                                                  frame,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,

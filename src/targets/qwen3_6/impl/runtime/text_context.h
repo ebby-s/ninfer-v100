@@ -198,6 +198,10 @@ public:
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
+    // Restores stage-0 bindings after a round's tail ops have been enqueued on the last stage;
+    // the caller owns round teardown when speculative work continues past the verify tail.
+    void finish_round();
+
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
     [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
@@ -261,6 +265,13 @@ private:
     };
 
     [[nodiscard]] ActiveLinear active_linear(std::uint32_t global_gidx);
+    // Embedding table the executing stage gathers through: the canonical table on the primary,
+    // the published replica on non-primary stages (MTP draft gathers).
+    [[nodiscard]] const Weight& active_embedding();
+    // Replay record storage for the executing stage (local GDN ordinals).
+    [[nodiscard]] const GdnReplayRecords& active_replay_records();
+    // RoPE delta tensor the executing stage's MTP kernels read.
+    [[nodiscard]] const Tensor& active_rope_delta() const;
     [[nodiscard]] const qwen3_6::PagedKVCache* active_text_cache(std::uint32_t global_fidx,
                                                                  std::uint32_t& local_fidx);
     // Transports the hidden activation into the next stage's workspace, adopts that stage's
@@ -269,8 +280,6 @@ private:
     // Graph-capture variant: copies only the source side into the transport staging slots and
     // rebinds to the fixed graph mirrors; run_layers returns at the boundary.
     void advance_stage_capture(Tensor& x);
-    // Restores stage-0 bindings after a round's tail ops have been enqueued on the last stage.
-    void finish_round();
 
     void bind();
 

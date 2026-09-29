@@ -1253,6 +1253,10 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+    // Cache the speculative round consumes: the last stage's MTP cache under a pipeline (its
+    // layer runs there), the primary's otherwise. Allocation lifecycle stays on the primary.
+    [[nodiscard]] qwen3_6::PagedKVCache* mtp_round_cache() noexcept;
+    [[nodiscard]] const qwen3_6::PagedKVCache* mtp_round_cache() const noexcept;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

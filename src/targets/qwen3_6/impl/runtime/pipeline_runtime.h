@@ -7,7 +7,9 @@
 #include "core/arena.h"
 #include "core/pipeline.h"
 #include "core/gdn_replay_records.h"
+#include "ninfer/ops/gdn_replay.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
+#include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/state_image.h>
 
 #include <optional>
@@ -31,6 +33,13 @@ struct PipelineStageResources {
     // when the round kind uses them.
     std::optional<GdnReplayRecords> replay_records;
     std::optional<GdnReplayRecords> mtp_lookup_replay_records;
+    // Stage-local MTP decode frame: same layout and dimensions as the primary frame, driven by the
+    // speculative round on the last stage.
+    std::unique_ptr<qwen3_6::MtpDecodeState> mtp_frame;
+    // Accepted-prefix rollback plans over the stage's own records and linear state; the settle
+    // path executes the primary fold and every stage fold together.
+    std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
 };
 
 // Cross-stage activation channel set: one forward and one backward transport per stage boundary.
@@ -57,6 +66,8 @@ struct PipelineExecution {
     std::vector<std::unique_ptr<PipelineTransport>> backward;  // boundary i: stage i + 1 -> stage i
     OrdinaryGraphMirrors ordinary_mirrors;  // last-stage tensors for the captured decode graphs
     cudaEvent_t ordinary_round_events[2] = {nullptr, nullptr};  // dev0-done, dev1-done
+    // Mirror of the primary RoPE delta for last-stage MTP kernels; prepared with the MTP mirrors.
+    Tensor mtp_rope_delta;
     // The speculative draft loop gathers draft-token embeddings through the replica view that
     // the loader published to the PipelineContext for this stage.
     [[nodiscard]] const Weight* embedding_view(int stage) const {
@@ -81,6 +92,14 @@ struct PipelineExecution {
 
     [[nodiscard]] StateImageDevicePool& stage_state_images(int stage) const {
         return *stages[static_cast<std::size_t>(stage) - 1].state_images;
+    }
+
+    [[nodiscard]] PipelineStageResources& stage_resources(int stage) {
+        return stages[static_cast<std::size_t>(stage) - 1];
+    }
+
+    [[nodiscard]] WorkspaceArena& last_workspace() const {
+        return *stages.back().workspace;
     }
 };
 

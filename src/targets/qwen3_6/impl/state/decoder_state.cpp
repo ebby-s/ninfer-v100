@@ -101,6 +101,10 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
     return PagedKVCacheView(*this, execution_tables_.row(row.handle()));
 }
 
+PagedKVCacheView PagedKVCache::execution_view_by_row(std::int32_t row_index) const {
+    return PagedKVCacheView(*this, execution_tables_.row_by_index(row_index));
+}
+
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const std::size_t stride        = layer_storage_.planes_per_layer();

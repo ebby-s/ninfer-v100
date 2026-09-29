@@ -115,7 +115,29 @@ null) and members `active_ctx_` (defaults `&ctx_`), `stage_work_` (defaults `&wo
 - Prefill flows chunks through stages sequentially; the rewrite-checkpoint hidden is captured on
   the last stage and shipped back like any output.
 
-### 3. MTP on the last stage — groundwork landed; round segmentation NEXT
+### 3. MTP on the last stage — implemented, one correctness defect open
+
+LANDS (all gated off at startup for `--pp>1` until the defect below is fixed):
+- Stage-local MTP KV pool + stage decode frame (full `MtpDecodeState` mirror, layout-cloned from
+  the primary), per-stage GDN replay records AND their accept-fold plans; the settle path executes
+  the primary fold plus every stage fold.
+- The pipeline round body: primary ingress upload + verify-input prep, whole-ingress/verify-ids/
+  target-positions/RoPE-delta ships, the verify traversal with mirror outputs, then acceptance,
+  `mtp_prepare_next_round`, MTP forward, proposal, and the draft loop entirely on the last stage
+  against the mirror frame, with egress-region and continuation-row ships back. Draft-token
+  embedding gathers through the replica view.
+- The GDN replay-fold op's launcher now takes the record's own layer count for its grid (stage
+  subsets fold correctly; head/channel geometries stay pinned) and `is_registered_fold_geometry`
+  admits contiguous layer subsets.
+- Startup validates `--pp>1` with any speculative backend as an explicit product gate.
+
+OPEN DEFECT: from the second decode round on, the last stage's verify predicts a different token
+than the reference for the same prefix (e.g. after "Tokyo" it predicts EOT instead of "."). Round
+one is correct; PP1 MTP and plain PP2 decode are both correct, and the first divergence is the
+anchor column of round two, so the stage-1 GDN/KV state restored after the round-one rollback is
+suspect (the fold executes with the expected commit count on the stage stream). Next step: dump
+the stage-1 GDN state and target-KV row contents after the fold and diff against an equivalent
+PP1 run at the same frontier.
 
 Landed (dormant while `--pp>1` rejects `--spec`; verified compile-clean with the full suite):
 - Last-stage MTP KV pool planned inside the stage decoder with the primary's page-group count;

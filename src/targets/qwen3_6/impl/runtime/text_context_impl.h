@@ -1,6 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include <cstddef>
-#include <cstdio>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -253,6 +252,31 @@ TextContext::ActiveLinear TextContext::active_linear(std::uint32_t global_gidx) 
     const std::uint32_t local = global_gidx - static_cast<std::uint32_t>(
         partition.first_layer(active_stage_) - partition.full_attention_base(active_stage_));
     return {&pipeline_exec_->stage_state_images(active_stage_).linear(), local};
+}
+
+const Weight& TextContext::active_embedding() {
+    if (pipeline_exec_ != nullptr && active_stage_ > 0) {
+        if (const Weight* replica = pipeline_exec_->embedding_view(active_stage_)) {
+            return *replica;
+        }
+    }
+    return *embed_;
+}
+
+const GdnReplayRecords& TextContext::active_replay_records() {
+    if (pipeline_exec_ != nullptr && active_stage_ > 0) {
+        auto& records = pipeline_exec_->stage_resources(active_stage_).replay_records;
+        if (records.has_value()) { return *records; }
+    }
+    return *replay_records_;
+}
+
+const Tensor& TextContext::active_rope_delta() const {
+    if (pipeline_exec_ != nullptr && active_stage_ > 0 &&
+        pipeline_exec_->mtp_rope_delta.data != nullptr) {
+        return pipeline_exec_->mtp_rope_delta;
+    }
+    return io_.rope_delta;
 }
 
 const qwen3_6::PagedKVCache*
@@ -550,7 +574,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
         emb = input_embeddings->view({kCfg.hidden, T});
     } else {
         emb = roots.embedding;
-        ops::embedding(flat_ids, *embed_, emb, s);
+        ops::embedding(flat_ids, active_embedding(), emb, s);
     }
 
     Tensor e = roots.normalized_embedding;
@@ -815,7 +839,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     const Tensor* rope_positions = explicit_rope_positions;
     if (rope_positions == nullptr) {
         generated_rope_positions = stage_work_->alloc(DType::I32, {T});
-        ops::offset_i32_positions(positions, io_.rope_delta, generated_rope_positions, active_ctx_->stream);
+        ops::offset_i32_positions(positions, active_rope_delta(), generated_rope_positions,
+                                  active_ctx_->stream);
         rope_positions = &generated_rope_positions;
     } else if (rope_positions->dtype != DType::I32 || rope_positions->ne[0] != T ||
                (rope_positions->ne[1] != 1 && rope_positions->ne[1] != 3) ||
@@ -847,7 +872,8 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
 
     auto position_scope  = stage_work_->scope();
     Tensor rope_position = stage_work_->alloc(DType::I32, {1});
-    ops::offset_i32_positions(position, io_.rope_delta, rope_position, active_ctx_->stream);
+    ops::offset_i32_positions(position, active_rope_delta(), rope_position,
+                              active_ctx_->stream);
     mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden,
                      nullptr);
     auto logits_scope = stage_work_->scope();
@@ -965,6 +991,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
             tap.capture_positions(cache_positions, stream);
         }
+        // Pipeline execution leaves the activation on the last stage; the tail follows it. The
+        // caller owns the round teardown (finish_round) because speculative acceptance continues
+        // on the last stage after this returns.
+        if (pipeline_exec_ != nullptr) { stream = active_ctx_->stream; }
         Tensor flat_hidden = hidden.view({kCfg.hidden, columns});
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
@@ -1148,7 +1178,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            GdnReplayRecordLayer records =
+                active_replay_records().layer(linear.layer, active_sequence_batch_);
             Variant::gdn_input_projection_record(
                 projection_input, *w.projection, *w.conv1d, conv_states, valid,
                 *active_linear_state_source_slots_, records.conv, query_output, key_output,
@@ -1190,7 +1221,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            GdnReplayRecordLayer records =
+                active_replay_records().layer(linear_verify.layer, active_sequence_batch_);
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
                                                *active_linear_state_source_slots_, records.key,

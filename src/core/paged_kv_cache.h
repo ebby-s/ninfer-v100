@@ -365,6 +365,10 @@ public:
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 
+    // Bounds-checked row tensor without lease validation. Pipeline mirror tables have no lease
+    // lifecycle; their rows are addressed by the primary pool's row index, which stays shared.
+    [[nodiscard]] Tensor row_by_index(std::int32_t row_index) const;
+
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 
     // Registers a passive mirror table pool that receives every row write this pool applies,

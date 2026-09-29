@@ -79,6 +79,8 @@ public:
     }
 
     [[nodiscard]] PagedKVCacheView execution_view(const KVExecutionRowLease& row) const;
+    // Row-index view for pipeline mirror caches whose rows are written by the primary pool.
+    [[nodiscard]] PagedKVCacheView execution_view_by_row(std::int32_t row_index) const;
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
