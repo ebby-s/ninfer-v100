@@ -133,8 +133,27 @@ Verified on 2x V100-PCIE-32GB with qwen3.8-27b nvfp4 and the deployed profile fl
   acceptance 78.5% vs 88.9% (the prefill draft bridge is skipped under PP, so early-round
   drafts are rebuilt by verification).
 
-Remaining polish for exact decode parity: per-stage CUDA Graph capture for the MTP round and
-the prefill draft bridge under PP.
+Per-stage MTP graph capture landed: the round is two graphs per topology chained by events with
+an eager stage-0 tail, and graph mirrors live in a dedicated per-stage arena outside the
+resettable round workspace.
+
+Benchmark (2026-09, 2x V100-PCIE-32GB, qwen3.8-27b nvfp4, deployed profile flags: int8 KV,
+prefill-chunk 2048, MTP n3, lm-head-draft, CUDA Graphs on; ~2400-token prompt, 400 generated
+tokens):
+
+| Metric | Single V100 (deployed) | Dual V100 (--pp 2) |
+|---|---:|---:|
+| Prefill | 814.3 tok/s | 830.2 tok/s |
+| Decode | 82.5 tok/s | 82.5 tok/s |
+| MTP acceptance | 91.2% | 86.7% |
+| Wall clock | 18.7 s | 18.7 s |
+| Output md5 (400 tok) | f80af115... | identical |
+| VRAM GPU1 / GPU2 | 21,918 / 0 MiB | 10,970 / 13,510 MiB |
+| Weights per device | 19.7 GiB | 9.05 GiB |
+| Max context (int8, auto) | 252,928 | 262,144 (native max) |
+
+Remaining polish: the prefill draft bridge under PP (the early-round acceptance delta) and the
+lookup-round path.
 
 LANDS (all gated off at startup for `--pp>1` until the defect below is fixed):
 - Stage-local MTP KV pool + stage decode frame (full `MtpDecodeState` mirror, layout-cloned from
