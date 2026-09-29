@@ -72,14 +72,16 @@ copies were unordered against stage-0 compute. Stage 0 now references the Engine
 and each transport records a consumed-side event its source stream waits on before reusing the
 pinned staging area.
 
-Status: WORKING with CUDA Graphs. `--pp 2` generation runs end-to-end on 2x V100-PCIE-32GB with
-the qwen3.8-27b nvfp4 artifact, captured as two per-stage graphs per topology (stage-0 forward
-segment, last-stage segment) chained per round by host-side events over slotted pinned staging,
-with an eager stage-0 tail (restore, scatter, sample, egress). Verified: greedy outputs are
-byte-identical to graphed PP=1 across short, creative, and multi-chunk prompts; graphed PP=2
-decodes within ~20% of graphed PP=1 wall-clock (vs ~2.4x slower eager); a 262144-token KV
-capacity that cannot fit one V100 (19.1 GB runtime needed, 13.4 GB available) loads and
-generates on two. Known v1 limitation: sampling presence/frequency penalties are inert on
+Status: WORKING with CUDA Graphs at decode parity. `--pp 2` generation runs end-to-end on
+2x V100-PCIE-32GB with the qwen3.8-27b nvfp4 artifact, captured as two per-stage graphs per
+topology (stage-0 forward segment, last-stage segment) chained per round by host-side events
+over slotted pinned staging, with an eager stage-0 tail (restore, scatter, sample, egress).
+Measured on a 200-token generation run: decode 29.3 tok/s (PP=2) vs 28.7 tok/s (PP=1) — parity,
+not a gap; prefill 199.7 vs 199.4 tok/s. Greedy outputs are byte-identical to graphed PP=1
+across short, creative, and multi-chunk prompts. A 262144-token KV capacity that cannot fit one
+V100 (19.1 GB runtime needed, 13.4 GB available) loads and generates on two. The earlier
+"~20% slower" reading was total-wall-clock polluted by a cold-cache artifact upload; warm-cache
+loads match PP=1 (2.4 s / 7.8 GiB/s). Known v1 limitation: sampling presence/frequency penalties are inert on
 non-primary stages (their counts array is stage-0 resident); reject penalty-bearing requests at
 the serving layer if exactness under penalties is required. Open: MTP speculative decoding under
 PP (the throughput leader on a single GPU), long-context output sweep, per-stage graph coverage
