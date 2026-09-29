@@ -174,6 +174,17 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    // One segment of the graph-captured ordinary decode round: 0 runs the primary side up to the
+    // boundary, 1 runs from the boundary through the head on the last stage.
+    void ordinary_decode_graph_segment(int segment, const Tensor& ids,
+                                       const Tensor& cache_positions, const Tensor& rope_positions,
+                                       const Tensor& kv_table_rows,
+                                       const Tensor& linear_state_source_slots,
+                                       const Tensor& linear_state_destination_slots,
+                                       ops::CausalAttentionExecutionEnvelope envelope,
+                                       std::int32_t batch);
+
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -255,6 +266,9 @@ private:
     // Transports the hidden activation into the next stage's workspace, adopts that stage's
     // device and workspace, and rebinds the per-round control tensors to stage-local mirrors.
     void advance_stage(Tensor& x);
+    // Graph-capture variant: copies only the source side into the transport staging slots and
+    // rebinds to the fixed graph mirrors; run_layers returns at the boundary.
+    void advance_stage_capture(Tensor& x);
     // Restores stage-0 bindings after a round's tail ops have been enqueued on the last stage.
     void finish_round();
 
@@ -318,6 +332,7 @@ private:
     WorkspaceArena& work_;
     qwen3_6::PipelineExecution* pipeline_exec_ = nullptr;
     int active_stage_                          = 0;
+    int graph_segment_                         = -1;  // -1 eager; 0/1 during graph capture
     DeviceContext* active_ctx_                 = nullptr;
     WorkspaceArena* stage_work_                = nullptr;
     std::vector<Tensor> stage_control_mirrors_;

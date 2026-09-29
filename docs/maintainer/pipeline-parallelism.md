@@ -72,14 +72,18 @@ copies were unordered against stage-0 compute. Stage 0 now references the Engine
 and each transport records a consumed-side event its source stream waits on before reusing the
 pinned staging area.
 
-Status: `--pp 2` generation runs end-to-end on 2x V100-PCIE-32GB with the qwen3.8-27b nvfp4
-artifact. Verified: greedy outputs are byte-identical to PP=1 across short, creative, and
-multi-chunk (~1.8K-token) prompts; a 262144-token KV capacity that cannot fit one V100 (19.1 GB
-runtime needed, 13.4 GB available) loads and generates on two. Known v1 limitation: sampling
-presence/frequency penalties are inert on non-primary stages (their counts array is stage-0
-resident); reject penalty-bearing requests at the serving layer if exactness under penalties is
-required. Long-context sweep, decode-throughput regression numbers, and per-stage CUDA Graph
-capture remain open work.
+Status: WORKING with CUDA Graphs. `--pp 2` generation runs end-to-end on 2x V100-PCIE-32GB with
+the qwen3.8-27b nvfp4 artifact, captured as two per-stage graphs per topology (stage-0 forward
+segment, last-stage segment) chained per round by host-side events over slotted pinned staging,
+with an eager stage-0 tail (restore, scatter, sample, egress). Verified: greedy outputs are
+byte-identical to graphed PP=1 across short, creative, and multi-chunk prompts; graphed PP=2
+decodes within ~20% of graphed PP=1 wall-clock (vs ~2.4x slower eager); a 262144-token KV
+capacity that cannot fit one V100 (19.1 GB runtime needed, 13.4 GB available) loads and
+generates on two. Known v1 limitation: sampling presence/frequency penalties are inert on
+non-primary stages (their counts array is stage-0 resident); reject penalty-bearing requests at
+the serving layer if exactness under penalties is required. Open: MTP speculative decoding under
+PP (the throughput leader on a single GPU), long-context output sweep, per-stage graph coverage
+for the MTP round.
 
 `TextContext` gains a trailing `qwen3_6::PipelineExecution*` constructor parameter (defaulted
 null) and members `active_ctx_` (defaults `&ctx_`), `stage_work_` (defaults `&work_`),

@@ -946,16 +946,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                               stage_device.stream);
             pipeline_execution->stages.push_back(std::move(resources));
         }
-        const std::size_t boundary_bytes =
+        // Per-slot bytes cover the largest staged copy (boundary activation, logits); the graph
+        // round stages several copies per direction at once, each in its own slot.
+        const std::size_t slot_bytes =
             std::max<std::size_t>(static_cast<std::size_t>(prefill_chunk) * TextConfig::hidden * 2,
-                                  std::size_t{32} << 20);
+                                  std::size_t{1} << 20);
+        constexpr std::size_t kRoundSlots = 8;
         for (int boundary = 0; boundary + 1 < pipeline->stage_count(); ++boundary) {
             pipeline_execution->forward.push_back(std::make_unique<PipelineTransport>(
                 pipeline->stage_device(boundary), pipeline->stage_device(boundary + 1),
-                boundary_bytes));
+                slot_bytes, kRoundSlots));
             pipeline_execution->backward.push_back(std::make_unique<PipelineTransport>(
                 pipeline->stage_device(boundary + 1), pipeline->stage_device(boundary),
-                boundary_bytes));
+                slot_bytes, kRoundSlots));
         }
         device_in.bind_to_current_thread();
     }
@@ -11305,8 +11308,38 @@ void ProgramImplCore::prepare_graphs() {
         device.synchronize();
 
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+        const bool pipeline_graphs = pipeline_execution != nullptr;
+        if (pipeline_graphs) {
+            pipeline_ordinary_graphs0.profiles.reserve(ordinary_profiles.size() *
+                                                       ordinary_batch_limit);
+            pipeline_ordinary_graphs1.profiles.reserve(ordinary_profiles.size() *
+                                                       ordinary_batch_limit);
+        }
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
             for (const GraphExecutionProfile planned : ordinary_profiles) {
+                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
+                                                                     planned.max + 1};
+                if (pipeline_graphs) {
+                    // Per-stage capture: the primary-side segment and the last-stage segment are
+                    // separate graphs chained per round by host-side events.
+                    pipeline_ordinary_graphs0.profiles.emplace_back();
+                    DecodeGraphProfile& profile0 = pipeline_ordinary_graphs0.profiles.back();
+                    profile0.batch_size             = batch_size;
+                    profile0.min_execution_frontier = planned.min;
+                    profile0.max_execution_frontier = planned.max;
+                    profile0.topology_class =
+                        planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                    pipeline_ordinary_graphs1.profiles.emplace_back();
+                    DecodeGraphProfile& profile1 = pipeline_ordinary_graphs1.profiles.back();
+                    profile1.batch_size             = batch_size;
+                    profile1.min_execution_frontier = planned.min;
+                    profile1.max_execution_frontier = planned.max;
+                    profile1.topology_class         = profile0.topology_class;
+                    schedule::capture_ordinary_decode_graphs(
+                        ordinary_state, static_cast<std::int32_t>(batch_size), envelope,
+                        profile0.definition, profile1.definition);
+                    continue;
+                }
                 ordinary_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
                 profile.batch_size             = batch_size;
@@ -11314,8 +11347,6 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
-                                                                     planned.max + 1};
                 schedule::capture_ordinary_decode_batch(ordinary_state,
                                                         static_cast<std::int32_t>(batch_size),
                                                         envelope, profile.definition);
@@ -11442,6 +11473,17 @@ void ProgramImplCore::prepare_graphs() {
     }
 
     if (!ordinary_graphs.profiles.empty()) {
+        instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
+    }
+    if (pipeline_execution != nullptr && !pipeline_ordinary_graphs0.profiles.empty()) {
+        instantiate_graph_family(pipeline_ordinary_graphs0, "ordinary stage0", device,
+                                 prepare_representative);
+        DeviceContext& last_stage =
+            pipeline_execution->stage_device(pipeline_execution->stage_count() - 1);
+        instantiate_graph_family(pipeline_ordinary_graphs1, "ordinary stage1", last_stage,
+                                 prepare_representative);
+    }
+    if (false) {
         instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -11960,8 +12002,21 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
+        DecodeGraphExecutable* stage1_executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
-        if (use_cuda_graph) {
+        if (use_cuda_graph && pipeline_execution != nullptr) {
+            DecodeGraphProfile& profile0 = select_graph_profile(
+                pipeline_ordinary_graphs0, static_cast<std::uint32_t>(lanes.size()),
+                maximum_frontier, "ordinary batch stage0");
+            DecodeGraphProfile& profile1 = select_graph_profile(
+                pipeline_ordinary_graphs1, static_cast<std::uint32_t>(lanes.size()),
+                maximum_frontier, "ordinary batch stage1");
+            executable       = &install_graph_profile(pipeline_ordinary_graphs0, profile0,
+                                                      "ordinary batch stage0");
+            stage1_executable = &install_graph_profile(pipeline_ordinary_graphs1, profile1,
+                                                       "ordinary batch stage1");
+            envelope = {profile0.min_execution_frontier + 1, profile0.max_execution_frontier + 1};
+        } else if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
@@ -11998,8 +12053,14 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                       state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
-        schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                        envelope, executable);
+        if (stage1_executable != nullptr) {
+            schedule::ordinary_decode_graph_round(schedule_state,
+                                                  static_cast<std::int32_t>(lanes.size()),
+                                                  envelope, executable, stage1_executable);
+        } else {
+            schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                            envelope, executable);
+        }
         submit_range.reset();
         timing.begin_wait();
         {

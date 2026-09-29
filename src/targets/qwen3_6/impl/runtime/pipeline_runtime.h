@@ -27,11 +27,29 @@ struct PipelineStageResources {
 };
 
 // Cross-stage activation channel set: one forward and one backward transport per stage boundary.
+// Fixed stage-last tensors baked into the captured decode graphs. Prepared once from the last
+// stage's workspace; captured addresses stay valid because graph-mode rounds perform no
+// allocations on the stage arenas.
+struct OrdinaryGraphMirrors {
+    bool prepared = false;
+    Tensor cache;
+    Tensor rope;
+    Tensor kv_rows;
+    Tensor src_slots;
+    Tensor dst_slots;
+    Tensor sampling;
+    Tensor x;       // boundary hidden mirror
+    Tensor hidden;  // final-norm output mirror
+    Tensor logits;  // lm_head output mirror
+};
+
 struct PipelineExecution {
     PipelineContext* context = nullptr;
     std::vector<PipelineStageResources> stages;  // entry i serves stage i + 1
     std::vector<std::unique_ptr<PipelineTransport>> forward;   // boundary i: stage i -> i + 1
     std::vector<std::unique_ptr<PipelineTransport>> backward;  // boundary i: stage i + 1 -> stage i
+    OrdinaryGraphMirrors ordinary_mirrors;  // last-stage tensors for the captured decode graphs
+    cudaEvent_t ordinary_round_events[2] = {nullptr, nullptr};  // dev0-done, dev1-done
 
     [[nodiscard]] int stage_count() const noexcept {
         return context != nullptr ? context->stage_count() : 1;

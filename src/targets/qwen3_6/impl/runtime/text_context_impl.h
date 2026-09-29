@@ -339,6 +339,110 @@ void TextContext::advance_stage(Tensor& x) {
     x = hidden_mirror;
 }
 
+void TextContext::advance_stage_capture(Tensor& x) {
+    const int next = active_stage_ + 1;
+    qwen3_6::OrdinaryGraphMirrors& mirrors = pipeline_exec_->ordinary_mirrors;
+    if (!mirrors.prepared) {
+        throw std::logic_error("pipeline graph mirrors must be prepared before capture");
+    }
+    // Source-side copies into private staging slots (captured as memcpy nodes in the source
+    // graph); the destination-side copies belong to the next stage's graph.
+    PipelineTransport& forward = *pipeline_exec_->forward[active_stage_];
+    const auto stage_out = [&](const Tensor& source, std::size_t slot) {
+        forward.enqueue_stage_out(source.data, source.bytes(), slot);
+    };
+    stage_out(*active_cache_positions_, 0);
+    stage_out(*active_rope_positions_, 1);
+    stage_out(*active_kv_table_rows_, 2);
+    if (active_linear_state_source_slots_ != nullptr) {
+        stage_out(*active_linear_state_source_slots_, 3);
+        stage_out(*active_linear_state_destination_slots_, 4);
+    }
+    stage_out(x, 5);
+
+    active_ctx_ = &pipeline_exec_->stage_device(next);
+    active_ctx_->bind_to_current_thread();
+    stage_work_ = &pipeline_exec_->stage_workspace(next);
+    active_stage_ = next;
+    active_cache_positions_ = &mirrors.cache;
+    active_rope_positions_ = &mirrors.rope;
+    active_kv_table_rows_ = &mirrors.kv_rows;
+    if (active_linear_state_source_slots_ != nullptr) {
+        active_linear_state_source_slots_ = &mirrors.src_slots;
+        active_linear_state_destination_slots_ = &mirrors.dst_slots;
+    }
+    x = mirrors.x;
+}
+
+void TextContext::ordinary_decode_graph_segment(
+    int segment, const Tensor& ids, const Tensor& cache_positions, const Tensor& rope_positions,
+    const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+    const Tensor& linear_state_destination_slots, ops::CausalAttentionExecutionEnvelope envelope,
+    std::int32_t batch) {
+    if (pipeline_exec_ == nullptr) {
+        throw std::logic_error("graph segments require an active pipeline");
+    }
+    qwen3_6::OrdinaryGraphMirrors& mirrors = pipeline_exec_->ordinary_mirrors;
+    graph_segment_ = segment;
+    if (segment == 0) {
+        cudaStream_t stream = active_ctx_->stream;
+        stage_work_->reset();
+        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
+        ScopedValue<const Tensor*> source_binding(active_linear_state_source_slots_,
+                                                  &linear_state_source_slots);
+        ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
+                                                       &linear_state_destination_slots);
+        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+        ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
+
+        Tensor x = stage_work_->alloc(DType::BF16, {kCfg.hidden, batch});
+        ops::embedding(ids, *embed_, x, stream);
+        NullTap tap;
+        run_layers(x, Phase::Verify, tap);
+        // run_layers returned at the boundary with the stage-out copies enqueued.
+    } else {
+        // The segment runs on the last stage with a fresh context: adopt its device, workspace,
+        // and stage index before touching any stage-scoped state.
+        active_stage_ = pipeline_exec_->stage_count() - 1;
+        active_ctx_ = &pipeline_exec_->stage_device(active_stage_);
+        active_ctx_->bind_to_current_thread();
+        stage_work_ = &pipeline_exec_->stage_workspace(active_stage_);
+        stage_work_->reset();
+        // Rebind to the fixed mirrors; the destination-side copies run first so the round's
+        // control values and boundary activation land on this stage before its layers execute.
+        PipelineTransport& forward = *pipeline_exec_->forward[active_stage_ - 1];
+        forward.enqueue_stage_in(mirrors.cache.data, mirrors.cache.bytes(), 0);
+        forward.enqueue_stage_in(mirrors.rope.data, mirrors.rope.bytes(), 1);
+        forward.enqueue_stage_in(mirrors.kv_rows.data, mirrors.kv_rows.bytes(), 2);
+        forward.enqueue_stage_in(mirrors.src_slots.data, mirrors.src_slots.bytes(), 3);
+        forward.enqueue_stage_in(mirrors.dst_slots.data, mirrors.dst_slots.bytes(), 4);
+        forward.enqueue_stage_in(mirrors.x.data, mirrors.x.bytes(), 5);
+
+        active_cache_positions_ = &mirrors.cache;
+        active_rope_positions_ = &mirrors.rope;
+        active_kv_table_rows_ = &mirrors.kv_rows;
+        active_linear_state_source_slots_ = &mirrors.src_slots;
+        active_linear_state_destination_slots_ = &mirrors.dst_slots;
+        active_sequence_batch_ = batch;
+        active_sequence_width_ = 1;
+        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+
+        Tensor x = mirrors.x;
+        NullTap tap;
+        run_layers(x, Phase::Verify, tap);
+        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, mirrors.hidden, active_ctx_->stream);
+        ops::linear(mirrors.hidden, *lm_head_, mirrors.logits, active_ctx_->stream);
+        PipelineTransport& back = *pipeline_exec_->backward[active_stage_ - 1];
+        back.enqueue_stage_out(mirrors.hidden.data, mirrors.hidden.bytes(), 0);
+        back.enqueue_stage_out(mirrors.logits.data, mirrors.logits.bytes(), 1);
+        finish_round();
+    }
+    graph_segment_ = -1;
+}
+
 void TextContext::finish_round() {
     if (pipeline_exec_ == nullptr) { return; }
     stage_control_mirrors_.clear();
@@ -1141,8 +1245,17 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
-        if (pipeline_exec_ != nullptr && active_stage_ < pipeline_exec_->stage_count() - 1 &&
+    int layer = graph_segment_ == 1
+                    ? pipeline_exec_->context->partition().first_layer(active_stage_)
+                    : 0;
+    for (; layer < kCfg.n_layers; ++layer) {
+        if (pipeline_exec_ != nullptr && graph_segment_ == 0 &&
+            layer >= pipeline_exec_->context->partition().first_layer(active_stage_ + 1)) {
+            advance_stage_capture(x);
+            return;
+        }
+        if (pipeline_exec_ != nullptr && graph_segment_ == -1 &&
+            active_stage_ < pipeline_exec_->stage_count() - 1 &&
             layer >= pipeline_exec_->context->partition().first_layer(active_stage_ + 1)) {
             advance_stage(x);
         }

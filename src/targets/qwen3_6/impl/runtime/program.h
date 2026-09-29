@@ -677,6 +677,8 @@ public:
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
     DecodeGraphFamily ordinary_graphs;
+    DecodeGraphFamily pipeline_ordinary_graphs0;
+    DecodeGraphFamily pipeline_ordinary_graphs1;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily mtp_lookup_graphs;
     DecodeGraphFamily dflash_graphs;

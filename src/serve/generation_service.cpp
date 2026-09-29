@@ -238,9 +238,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.pipeline_size            = options_.pipeline_size;
     engine_options.pipeline_devices         = options_.pipeline_devices;
     engine_options.pipeline_embedding_replica = options_.pipeline_embedding_replica;
-    // Pipeline decode capture is per-stage CUDA Graph work that v1 defers; eager decode runs.
-    engine_options.use_cuda_graph =
-        options_.use_cuda_graph && options_.pipeline_size == 1;
+    engine_options.use_cuda_graph = options_.use_cuda_graph;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;

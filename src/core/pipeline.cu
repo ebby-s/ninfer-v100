@@ -1,7 +1,6 @@
 #include "core/pipeline.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <string>
 #include <utility>
 
@@ -101,8 +100,6 @@ PipelineContext::PipelineContext(DeviceContext& primary_device, std::vector<int>
                                               static_cast<int>(group_.size()))),
       embedding_replica_(embedding_replica) {
     group_.require_uniform_compute_capability();
-    std::fprintf(stderr, "DBG PipelineContext: stages=%d remaining=%zu\n", partition_.stages,
-                 remaining_ids.size());
     if (embedding_replica_ && partition_.stages < 2) {
         pipeline_error("embedding replica requires at least two stages");
     }
@@ -177,8 +174,9 @@ void DeviceGroup::require_uniform_compute_capability() const {
 }
 
 PipelineTransport::PipelineTransport(const DeviceContext& from, const DeviceContext& to,
-                                     std::size_t capacity_bytes)
-    : from_(from), to_(to), capacity_bytes_(capacity_bytes), staging_(capacity_bytes) {
+                                     std::size_t capacity_bytes, std::size_t slot_count)
+    : from_(from), to_(to), capacity_bytes_(capacity_bytes), staging_(capacity_bytes),
+      slot_count_(std::max<std::size_t>(slot_count, 1)) {
     if (capacity_bytes == 0) { pipeline_error("transport capacity must be positive"); }
     // The staging event is recorded on the source stream, so it must be created with the source
     // device current.
@@ -199,6 +197,29 @@ PipelineTransport::~PipelineTransport() {
     if (staged_ready_ != nullptr) { cudaEventDestroy(staged_ready_); }
     to_.bind_to_current_thread_noexcept();
     if (consumed_ready_ != nullptr) { cudaEventDestroy(consumed_ready_); }
+}
+
+void* PipelineTransport::staging(std::size_t slot) const {
+    const std::size_t slot_bytes = capacity_bytes_ / slot_count_;
+    return static_cast<std::byte*>(staging_.data()) + slot * slot_bytes;
+}
+
+void PipelineTransport::enqueue_stage_out(const void* source, std::size_t bytes,
+                                          std::size_t slot) const {
+    if (bytes == 0) { return; }
+    require_capacity(bytes);
+    from_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(staging(slot), source, bytes, cudaMemcpyDeviceToHost,
+                               from_.stream));
+}
+
+void PipelineTransport::enqueue_stage_in(void* destination, std::size_t bytes,
+                                         std::size_t slot) const {
+    if (bytes == 0) { return; }
+    require_capacity(bytes);
+    to_.bind_to_current_thread();
+    CUDA_CHECK(cudaMemcpyAsync(destination, staging(slot), bytes, cudaMemcpyHostToDevice,
+                               to_.stream));
 }
 
 void PipelineTransport::require_capacity(std::size_t bytes) const {
@@ -224,7 +245,7 @@ void PipelineTransport::enqueue(const void* source, void* destination, std::size
         // Cross-device stages: stage through pinned host memory. The two V100-PCIe slots on the
         // reference host expose no peer access; a peer-direct fast path can replace this branch
         // once hardware that reports cudaDeviceCanAccessPeer is the target.
-        CUDA_CHECK(cudaMemcpyAsync(staging_.data(), source, bytes, cudaMemcpyDeviceToHost,
+        CUDA_CHECK(cudaMemcpyAsync(staging(0), source, bytes, cudaMemcpyDeviceToHost,
                                    from_.stream));
     }
     CUDA_CHECK(cudaEventRecord(staged_ready_, from_.stream));
@@ -232,7 +253,7 @@ void PipelineTransport::enqueue(const void* source, void* destination, std::size
     to_.bind_to_current_thread();
     CUDA_CHECK(cudaStreamWaitEvent(to_.stream, staged_ready_, 0));
     if (from_.device != to_.device) {
-        CUDA_CHECK(cudaMemcpyAsync(destination, staging_.data(), bytes, cudaMemcpyHostToDevice,
+        CUDA_CHECK(cudaMemcpyAsync(destination, staging(0), bytes, cudaMemcpyHostToDevice,
                                    to_.stream));
         CUDA_CHECK(cudaEventRecord(consumed_ready_, to_.stream));
         have_consumed_ = true;

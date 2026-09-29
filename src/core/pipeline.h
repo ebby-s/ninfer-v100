@@ -120,9 +120,11 @@ private:
 // holds because every channel consumer runs its stages back-to-back on one host thread.
 class PipelineTransport {
 public:
-    // `capacity_bytes` is the upper bound of any single transfer through this channel.
+    // `capacity_bytes` is the upper bound of any single transfer through this channel;
+    // `slot_count` divides the staging area into `capacity_bytes / slot_count` private regions
+    // addressed by the slot index (graph-captured rounds need one slot per staged copy).
     PipelineTransport(const DeviceContext& from, const DeviceContext& to,
-                      std::size_t capacity_bytes);
+                      std::size_t capacity_bytes, std::size_t slot_count = 1);
     ~PipelineTransport();
     PipelineTransport(const PipelineTransport&)            = delete;
     PipelineTransport& operator=(const PipelineTransport&) = delete;
@@ -132,6 +134,15 @@ public:
     // Copies `bytes` from `source` (stage `from`) to `destination` (stage `to`), ordered after
     // prior work on the source stream and ordered before subsequent destination-stream work.
     void enqueue(const void* source, void* destination, std::size_t bytes) const;
+
+    // CUDA-graph capture support. A captured round crosses devices between two graphs, so the
+    // copy splits into a source-side D2H (captured into the source graph) and a destination-side
+    // H2D (captured into the destination graph); the event orchestration is host-side between
+    // graph launches instead. `slot` selects a private staging region so every copy inside one
+    // captured graph keeps its own staging area.
+    void enqueue_stage_out(const void* source, std::size_t bytes, std::size_t slot) const;
+    void enqueue_stage_in(void* destination, std::size_t bytes, std::size_t slot) const;
+    [[nodiscard]] void* staging(std::size_t slot) const;
 
 private:
     void require_capacity(std::size_t bytes) const;
@@ -143,6 +154,7 @@ private:
     cudaEvent_t staged_ready_   = nullptr;  // source copy complete
     cudaEvent_t consumed_ready_ = nullptr;  // staging area fully read by the destination side
     mutable bool have_consumed_ = false;
+    std::size_t slot_count_     = 1;
 };
 
 } // namespace ninfer
