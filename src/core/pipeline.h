@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/weight.h"
 
 #include <cuda_runtime.h>
 
@@ -102,7 +103,11 @@ public:
     // no replica (the primary stage uses the model's own embedding tensor).
     [[nodiscard]] void* embedding_replica_ptr(int stage) const;
 
-    void publish_embedding_replica(int stage, DeviceBuffer buffer);
+    void publish_embedding_replica(int stage, DeviceBuffer buffer, Weight view);
+    // A device-resident embedding replica with `view`'s metadata, valid for the stage the loader
+    // published it to. The speculative draft loop gathers draft-token embeddings through this
+    // view on its own stage device.
+    [[nodiscard]] const Weight* embedding_replica_view(int stage) const;
 
 private:
     DeviceGroup group_;
@@ -110,6 +115,7 @@ private:
     bool embedding_replica_              = false;
     std::size_t embedding_replica_bytes_ = 0;
     std::vector<DeviceBuffer> embedding_replicas_; // per stage; empty where no replica is held
+    std::vector<Weight> embedding_replica_views_;  // parallel per-stage views
 };
 
 // One inter-stage activation channel. Copies traverse device -> pinned host -> device. All

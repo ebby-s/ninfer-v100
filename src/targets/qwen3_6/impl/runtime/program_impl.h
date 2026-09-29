@@ -885,20 +885,27 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             std::size_t total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             LayoutBuilder builder;
+            // The MTP layer runs on the last stage, so its KV pool lives there; the primary
+            // pool owns the page lifecycle and mirrors content by identical indices.
+            const bool stage_is_last = stage == pipeline->stage_count() - 1;
+            const bool stage_mtp = stage_is_last && plan.features.mtp();
             const qwen3_6::DecoderStateLayout decoder_layout = qwen3_6::plan_decoder_state(
                 builder,
                 qwen3_6::DecoderStateSpec{
                     .full_attention_layers =
                         static_cast<std::uint32_t>(partition.full_attention_count(stage)),
-                    .mtp_layers         = 0,
+                    .mtp_layers         = stage_mtp ? TextConfig::mtp_layers : 0,
                     .capacity           = plan.capacity,
                     .kv_heads           = TextConfig::kv_heads,
                     .attention_head_dim = TextConfig::head_dim,
                     .kv_storage         = plan.kv_storage,
-                    .enable_mtp         = false,
+                    .enable_mtp         = stage_mtp,
                     .kv_table_rows      = stage_table_rows,
                     .text_physical_page_groups  = plan.main_page_groups,
-                    .mtp_physical_page_groups   = 0,
+                    .mtp_physical_page_groups =
+                        stage_mtp && plan.persistent.decoder.mtp_kv.has_value()
+                            ? plan.persistent.decoder.mtp_kv->pages.spec.page_group_count
+                            : 0,
                 });
             const qwen3_6::StateImageDeviceLayout state_layout =
                 qwen3_6::plan_state_image_device_pool(
@@ -917,6 +924,37 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                             },
                         .hidden = TextConfig::hidden,
                     });
+            std::optional<GdnReplayRecordLayout> stage_replay_layout;
+            std::optional<GdnReplayRecordLayout> stage_lookup_layout;
+            if (plan.speculative_backend == SpeculativeBackend::Mtp) {
+                // Stage-local replay storage planned with the stage's own GDN layer count; the
+                // primary records keep the primary layers. Planning precedes the arena sizing so
+                // these regions are included in stage_bytes.
+                stage_replay_layout = plan_gdn_replay_records(
+                    builder,
+                    GdnReplayRecordSpec{
+                        .layers = static_cast<std::uint32_t>(partition.gdn_count(stage)),
+                        .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                        .width = static_cast<std::int32_t>(plan.draft_window + 1U),
+                        .conv_channels  = TextConfig::convolution_dim,
+                        .qk_heads       = TextConfig::gdn_key_heads,
+                        .value_heads    = TextConfig::gdn_value_heads,
+                        .key_dim        = TextConfig::gdn_key_head_dim,
+                        .value_dim      = TextConfig::gdn_value_head_dim,
+                    });
+                stage_lookup_layout = plan_gdn_replay_records(
+                    builder,
+                    GdnReplayRecordSpec{
+                        .layers = static_cast<std::uint32_t>(partition.gdn_count(stage)),
+                        .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                        .width = static_cast<std::int32_t>(qwen3_6::kMtpLookupMaximumWidth),
+                        .conv_channels  = TextConfig::convolution_dim,
+                        .qk_heads       = TextConfig::gdn_key_heads,
+                        .value_heads    = TextConfig::gdn_value_heads,
+                        .key_dim        = TextConfig::gdn_key_head_dim,
+                        .value_dim      = TextConfig::gdn_value_head_dim,
+                    });
+            }
             const std::size_t stage_bytes = builder.finish(256, "pipeline stage persistent");
             if (stage_bytes > free_bytes) {
                 throw std::overflow_error(
@@ -935,6 +973,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                 plan.workspace.capacity +
                 static_cast<std::size_t>(prefill_chunk) * TextConfig::hidden * 2 +
                 (std::size_t{8} << 20);
+            if (stage_replay_layout) {
+                resources.replay_records.emplace(stage_backing, *stage_replay_layout);
+                resources.mtp_lookup_replay_records.emplace(stage_backing, *stage_lookup_layout);
+            }
             resources.workspace = std::make_unique<DeviceArena>(stage_workspace_bytes);
             // Content mirrors follow the primary pools transitively: stage 1 mirrors stage 0,
             // stage 2 mirrors stage 1, and every primitive forwards along the chain.
@@ -944,6 +986,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                 resources.decoder->text_kv.execution_tables(), stage_device.stream);
             state_images->linear().set_mirror(resources.state_images->linear(),
                                               stage_device.stream);
+            if (decoder->mtp_cache() != nullptr && resources.decoder->mtp_cache() != nullptr) {
+                decoder->mtp_cache()->page_pool().set_mirror(
+                    resources.decoder->mtp_cache()->page_pool(), stage_device.stream);
+                decoder->mtp_cache()->execution_tables().set_mirror(
+                    resources.decoder->mtp_cache()->execution_tables(), stage_device.stream);
+            }
             pipeline_execution->stages.push_back(std::move(resources));
         }
         // Per-slot bytes cover the largest staged copy (boundary activation, logits); the graph

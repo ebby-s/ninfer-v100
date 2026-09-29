@@ -6,8 +6,11 @@
 
 #include "core/arena.h"
 #include "core/pipeline.h"
+#include "core/gdn_replay_records.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/state_image.h>
+
+#include <optional>
 
 #include <memory>
 #include <vector>
@@ -24,6 +27,10 @@ struct PipelineStageResources {
     std::unique_ptr<DeviceArena> workspace;    // stage per-layer temporaries
     std::unique_ptr<DecoderState> decoder;     // stage text KV planes + execution tables
     std::unique_ptr<StateImageDevicePool> state_images;  // stage GDN linear state
+    // Speculative-decoding replay storage for the stage's GDN layers (local ordinals); present
+    // when the round kind uses them.
+    std::optional<GdnReplayRecords> replay_records;
+    std::optional<GdnReplayRecords> mtp_lookup_replay_records;
 };
 
 // Cross-stage activation channel set: one forward and one backward transport per stage boundary.
@@ -50,6 +57,11 @@ struct PipelineExecution {
     std::vector<std::unique_ptr<PipelineTransport>> backward;  // boundary i: stage i + 1 -> stage i
     OrdinaryGraphMirrors ordinary_mirrors;  // last-stage tensors for the captured decode graphs
     cudaEvent_t ordinary_round_events[2] = {nullptr, nullptr};  // dev0-done, dev1-done
+    // The speculative draft loop gathers draft-token embeddings through the replica view that
+    // the loader published to the PipelineContext for this stage.
+    [[nodiscard]] const Weight* embedding_view(int stage) const {
+        return context != nullptr ? context->embedding_replica_view(stage) : nullptr;
+    }
 
     [[nodiscard]] int stage_count() const noexcept {
         return context != nullptr ? context->stage_count() : 1;

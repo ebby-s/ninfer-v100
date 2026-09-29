@@ -264,7 +264,20 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                            destination.transfer_stream));
                 CUDA_CHECK(cudaStreamSynchronize(destination.transfer_stream));
             }
-            pipeline->publish_embedding_replica(stage, std::move(replica));
+            const auto shift = reinterpret_cast<std::ptrdiff_t>(replica.p) -
+                               reinterpret_cast<std::ptrdiff_t>(embedding.payload);
+            Weight view      = embedding;
+            view.payload     = reinterpret_cast<const std::byte*>(embedding.payload) + shift;
+            if (view.qdata != nullptr) {
+                view.qdata = reinterpret_cast<const std::byte*>(view.qdata) + shift;
+            }
+            if (view.qhigh != nullptr) {
+                view.qhigh = reinterpret_cast<const std::byte*>(view.qhigh) + shift;
+            }
+            if (view.scales != nullptr) {
+                view.scales = reinterpret_cast<const std::byte*>(view.scales) + shift;
+            }
+            pipeline->publish_embedding_replica(stage, std::move(replica), view);
         }
     }
 

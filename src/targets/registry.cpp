@@ -189,14 +189,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             device, std::vector<int>(stage_devices.begin() + 1, stage_devices.end()),
             Target::kTextLayerCount, Target::kFullAttentionInterval,
             options.pipeline_embedding_replica);
-        // v1 pipeline scope: plain generation with MTP. CUDA Graph decode capture, Vision input,
-        // and masked-block speculative decoding cross stage boundaries and are rejected until
-        // their per-stage plumbing lands.
-        if (options.speculative.backend == SpeculativeBackend::DFlash2 ||
-            options.speculative.backend == SpeculativeBackend::DFlash) {
+        // v1 pipeline scope: plain generation. The speculative and Vision paths cross stage
+        // boundaries; their per-stage round segmentation is the open work in
+        // docs/maintainer/pipeline-parallelism.md.
+        if (options.speculative.backend != SpeculativeBackend::None) {
             throw std::invalid_argument(
-                "pipeline parallelism (--pp) does not support masked-block speculative decoding; "
-                "use --spec none or --spec mtp");
+                "pipeline parallelism (--pp) does not support speculative decoding yet; "
+                "use --spec none");
         }
         if (options.enable_vision) {
             throw std::invalid_argument(

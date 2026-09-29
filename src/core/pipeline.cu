@@ -103,7 +103,10 @@ PipelineContext::PipelineContext(DeviceContext& primary_device, std::vector<int>
     if (embedding_replica_ && partition_.stages < 2) {
         pipeline_error("embedding replica requires at least two stages");
     }
-    if (embedding_replica_) { embedding_replicas_.resize(static_cast<std::size_t>(partition_.stages)); }
+    if (embedding_replica_) {
+        embedding_replicas_.resize(static_cast<std::size_t>(partition_.stages));
+        embedding_replica_views_.resize(static_cast<std::size_t>(partition_.stages));
+    }
 }
 
 void* PipelineContext::embedding_replica_ptr(int stage) const {
@@ -113,12 +116,20 @@ void* PipelineContext::embedding_replica_ptr(int stage) const {
     return buffer.bytes != 0 ? buffer.p : nullptr;
 }
 
-void PipelineContext::publish_embedding_replica(int stage, DeviceBuffer buffer) {
+void PipelineContext::publish_embedding_replica(int stage, DeviceBuffer buffer, Weight view) {
     if (!embedding_replica_) { pipeline_error("embedding replica is disabled"); }
     if (stage <= 0 || stage >= partition_.stages) {
         pipeline_error("embedding replica stage must be a non-primary stage");
     }
-    embedding_replicas_[static_cast<std::size_t>(stage)] = std::move(buffer);
+    embedding_replicas_[static_cast<std::size_t>(stage)]     = std::move(buffer);
+    embedding_replica_views_[static_cast<std::size_t>(stage)] = view;
+}
+
+const Weight* PipelineContext::embedding_replica_view(int stage) const {
+    if (!embedding_replica_ || stage <= 0 || stage >= partition_.stages) { return nullptr; }
+    return embedding_replica_views_[static_cast<std::size_t>(stage)].payload != nullptr
+               ? &embedding_replica_views_[static_cast<std::size_t>(stage)]
+               : nullptr;
 }
 
 DeviceGroup::DeviceGroup(std::vector<int> device_ids) {

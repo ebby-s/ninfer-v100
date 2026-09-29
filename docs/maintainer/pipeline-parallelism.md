@@ -115,13 +115,42 @@ null) and members `active_ctx_` (defaults `&ctx_`), `stage_work_` (defaults `&wo
 - Prefill flows chunks through stages sequentially; the rewrite-checkpoint hidden is captured on
   the last stage and shipped back like any output.
 
-### 3. MTP on the last stage (after plain decode verifies)
+### 3. MTP on the last stage — groundwork landed; round segmentation NEXT
 
-`mtp_forward_*` and the proposal head run entirely on the last stage: the backbone output hidden
-is produced there and draft-token embeddings gather from the local replica. `target_verify`
-re-enters stage 0 per accepted round. GDN replay records split per stage with local ordinals.
+Landed (dormant while `--pp>1` rejects `--spec`; verified compile-clean with the full suite):
+- Last-stage MTP KV pool planned inside the stage decoder with the primary's page-group count;
+  the primary MTP pool/tables register it as a passive mirror, so Program's MTP page lifecycle
+  mirrors content by identical physical indices exactly like the text KV.
+- Stage-local GDN replay records (both the verify-record and MTP-lookup kinds) planned with the
+  stage's GDN layer count before the arena sizing and constructed on the stage backing.
+- The embedding replica is published as a full `Weight` view per non-primary stage (all device
+  pointers rebased onto the replica buffer), reachable through
+  `PipelineExecution::embedding_view(stage)`.
+
+Remaining segmentation contract:
+1. MTP attention on the last stage must read the STAGE-local MTP cache. Add
+   `PagedKVCacheView` construction from a `PagedKVCache` + row INDEX (the mirror tables have no
+   lease lifecycle), and route `mtp_kv_view(sequence)`/`MtpBatchContext.mtp_cache` to
+   `pipeline_execution->stage_decoder(last)` when a pipeline is active. Replace
+   `batch_mtp_kv_->batch_layer_view(0)` and `io_.backend_kv_table_row` uses in the MTP paths
+   with the stage-local cache plus its block-table matrix, and use the replica embedding view in
+   `mtp_forward_stem`/bridge sites (the canonical `embed_` stays for stage-0 segments).
+2. `io_.mtp` round state (`position`, `draft_tokens`, `ar_hidden`, `target_positions`, proposal
+   buffers) and the MTP decode frame tensors are primary-device allocations consumed by last-stage
+   kernels. Mirror the frame into the last stage workspace (the same fixed-mirror pattern as
+   `OrdinaryGraphMirrors`, one for the MTP round), and ship host-visible results back through the
+   backward transport before the egress D2H: accepted ids, per-row accepted counts, continuation
+   hidden rows, and the final draft window.
+3. The acceptance/replay ops (`ops::mtp_round_*`, replay apply, continuation scatter) run where
+   their operands live: acceptance on the last stage (its mirrors), continuation scatter on the
+   primary after the ship-back, replay application per stage through the mirrored record pools.
+4. Capture as `capture_mtp_decode_graphs` with the same two-graph structure (graph 0 up to the
+   boundary, graph 1 through proposal + ship-back), per-round driver chained by the existing
+   events, then flip the `--spec` gate for `--pp>1` and run the exactness battery
+   (`--spec mtp --draft-tokens 3`, greedy, PP=1 vs PP=2 must match).
+
 DFlash2 stays rejected (its draft taps intermediate target layers across the boundary); Vision
-stays rejected (its features feed stage-0 embeddings but its prefill tap contract spans stages).
+stays rejected (its prefill tap contract spans stages).
 
 ### 4. Per-stage CUDA Graph decode (deferred)
 
