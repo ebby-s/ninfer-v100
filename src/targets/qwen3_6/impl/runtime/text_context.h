@@ -176,6 +176,13 @@ public:
 
     // One segment of the graph-captured ordinary decode round: 0 runs the primary side up to the
     // boundary, 1 runs from the boundary through the head on the last stage.
+    // One segment of the graph-captured speculative verify: 0 runs the primary side to the
+    // boundary, 1 resumes on the last stage through the head into the mirror outputs.
+    void target_verify_graph_segment(int segment, const Tensor& ids, const Tensor& cache_positions,
+                                     const Tensor& rope_positions, const Tensor& valid_columns,
+                                     const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                                     ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                                     Tensor& logits, Tensor& target_tokens);
     void ordinary_decode_graph_segment(int segment, const Tensor& ids,
                                        const Tensor& cache_positions, const Tensor& rope_positions,
                                        const Tensor& kv_table_rows,

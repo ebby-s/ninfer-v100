@@ -380,7 +380,12 @@ void TextContext::advance_stage_capture(Tensor& x) {
     stage_out(*active_kv_table_rows_, 2);
     if (active_linear_state_source_slots_ != nullptr) {
         stage_out(*active_linear_state_source_slots_, 3);
+    }
+    if (active_linear_state_destination_slots_ != nullptr) {
         stage_out(*active_linear_state_destination_slots_, 4);
+    }
+    if (active_valid_columns_ != nullptr && mirrors.valid.data != nullptr) {
+        stage_out(*active_valid_columns_, 6);
     }
     stage_out(x, 5);
 
@@ -395,7 +400,95 @@ void TextContext::advance_stage_capture(Tensor& x) {
         active_linear_state_source_slots_ = &mirrors.src_slots;
         active_linear_state_destination_slots_ = &mirrors.dst_slots;
     }
+    if (active_valid_columns_ != nullptr && mirrors.valid.data != nullptr) {
+        active_valid_columns_ = &mirrors.valid;
+    }
     x = mirrors.x;
+}
+
+void TextContext::target_verify_graph_segment(
+    int segment, const Tensor& ids, const Tensor& cache_positions, const Tensor& rope_positions,
+    const Tensor& valid_columns, const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+    ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
+    Tensor& target_tokens) {
+    if (pipeline_exec_ == nullptr) {
+        throw std::logic_error("graph segments require an active pipeline");
+    }
+    qwen3_6::OrdinaryGraphMirrors& mirrors = pipeline_exec_->ordinary_mirrors;
+    const std::int32_t width   = ids.ne[0];
+    const std::int32_t batch   = ids.ne[1];
+    const std::int32_t columns = width * batch;
+    graph_segment_ = segment;
+    if (segment == 0) {
+        cudaStream_t stream = active_ctx_->stream;
+        stage_work_->reset();
+        ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
+        ScopedValue<const Tensor*> source_binding(active_linear_state_source_slots_,
+                                                  &linear_state_source_slots);
+        ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
+        ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+        ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+
+        Tensor x        = stage_work_->alloc(DType::BF16, {kCfg.hidden, columns});
+        Tensor flat_ids = ids.view({columns});
+        ops::embedding(flat_ids, *embed_, x, stream);
+        NullTap tap;
+        run_layers(x, Phase::Verify, tap);
+        // run_layers returned at the boundary with the stage-out copies enqueued.
+    } else {
+        active_stage_ = pipeline_exec_->stage_count() - 1;
+        active_ctx_ = &pipeline_exec_->stage_device(active_stage_);
+        active_ctx_->bind_to_current_thread();
+        stage_work_ = &pipeline_exec_->stage_workspace(active_stage_);
+        stage_work_->reset();
+        PipelineTransport& forward = *pipeline_exec_->forward[active_stage_ - 1];
+        const std::size_t row_bytes = static_cast<std::size_t>(batch) * sizeof(std::int32_t);
+        // The verify's attention holds one position per verify column; the control mirrors for
+        // positions are column-width, the row-table mirrors stay row-width.
+        const std::size_t column_bytes = static_cast<std::size_t>(columns) * sizeof(std::int32_t);
+        Tensor cache_mirror = mirrors.cache.slice(0, 0, columns);
+        Tensor rope_mirror = mirrors.rope.slice(0, 0, columns);
+        Tensor kv_mirror = mirrors.kv_rows.slice(0, 0, batch);
+        Tensor src_mirror = mirrors.src_slots.slice(0, 0, batch);
+        Tensor dst_mirror = mirrors.dst_slots.slice(0, 0, batch);
+        Tensor valid_mirror = mirrors.valid.slice(0, 0, batch);
+        forward.enqueue_stage_in(cache_mirror.data, column_bytes, 0);
+        forward.enqueue_stage_in(rope_mirror.data, column_bytes, 1);
+        forward.enqueue_stage_in(kv_mirror.data, row_bytes, 2);
+        forward.enqueue_stage_in(src_mirror.data, row_bytes, 3);
+        forward.enqueue_stage_in(dst_mirror.data, row_bytes, 4);
+        forward.enqueue_stage_in(valid_mirror.data, row_bytes, 6);
+        const std::size_t x_bytes =
+            static_cast<std::size_t>(kCfg.hidden) * columns * dtype_size(DType::BF16);
+        forward.enqueue_stage_in(mirrors.x.data, x_bytes, 5);
+
+        active_cache_positions_ = &cache_mirror;
+        active_rope_positions_ = &rope_mirror;
+        active_kv_table_rows_ = &kv_mirror;
+        active_linear_state_source_slots_ = &src_mirror;
+        active_linear_state_destination_slots_ = &dst_mirror;
+        active_valid_columns_ = &valid_mirror;
+        active_sequence_batch_ = batch;
+        active_sequence_width_ = width;
+        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+
+        Tensor x = mirrors.x.slice(1, 0, columns).view({kCfg.hidden, columns});
+        NullTap tap;
+        run_layers(x, Phase::Verify, tap);
+        Tensor flat_hidden = hidden.view({kCfg.hidden, columns});
+        Tensor flat_logits = logits.view({kCfg.vocab, columns});
+        Tensor flat_tokens = target_tokens.view({columns});
+        const cudaStream_t stream = active_ctx_->stream;
+        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
+        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        // The caller owns the round teardown: speculative acceptance and the draft phase
+        // continue on this stage after the verify segment returns.
+    }
+    graph_segment_ = -1;
 }
 
 void TextContext::ordinary_decode_graph_segment(
@@ -438,30 +531,40 @@ void TextContext::ordinary_decode_graph_segment(
         // Rebind to the fixed mirrors; the destination-side copies run first so the round's
         // control values and boundary activation land on this stage before its layers execute.
         PipelineTransport& forward = *pipeline_exec_->forward[active_stage_ - 1];
-        forward.enqueue_stage_in(mirrors.cache.data, mirrors.cache.bytes(), 0);
-        forward.enqueue_stage_in(mirrors.rope.data, mirrors.rope.bytes(), 1);
-        forward.enqueue_stage_in(mirrors.kv_rows.data, mirrors.kv_rows.bytes(), 2);
-        forward.enqueue_stage_in(mirrors.src_slots.data, mirrors.src_slots.bytes(), 3);
-        forward.enqueue_stage_in(mirrors.dst_slots.data, mirrors.dst_slots.bytes(), 4);
-        forward.enqueue_stage_in(mirrors.x.data, mirrors.x.bytes(), 5);
+        const std::size_t row_bytes = static_cast<std::size_t>(batch) * sizeof(std::int32_t);
+        Tensor cache_mirror = mirrors.cache.slice(0, 0, batch);
+        Tensor rope_mirror = mirrors.rope.slice(0, 0, batch);
+        Tensor kv_mirror = mirrors.kv_rows.slice(0, 0, batch);
+        Tensor src_mirror = mirrors.src_slots.slice(0, 0, batch);
+        Tensor dst_mirror = mirrors.dst_slots.slice(0, 0, batch);
+        forward.enqueue_stage_in(cache_mirror.data, row_bytes, 0);
+        forward.enqueue_stage_in(rope_mirror.data, row_bytes, 1);
+        forward.enqueue_stage_in(kv_mirror.data, row_bytes, 2);
+        forward.enqueue_stage_in(src_mirror.data, row_bytes, 3);
+        forward.enqueue_stage_in(dst_mirror.data, row_bytes, 4);
+        const std::size_t x_bytes =
+            static_cast<std::size_t>(kCfg.hidden) * batch * dtype_size(DType::BF16);
+        forward.enqueue_stage_in(mirrors.x.data, x_bytes, 5);
 
-        active_cache_positions_ = &mirrors.cache;
-        active_rope_positions_ = &mirrors.rope;
-        active_kv_table_rows_ = &mirrors.kv_rows;
-        active_linear_state_source_slots_ = &mirrors.src_slots;
-        active_linear_state_destination_slots_ = &mirrors.dst_slots;
+        active_cache_positions_ = &cache_mirror;
+        active_rope_positions_ = &rope_mirror;
+        active_kv_table_rows_ = &kv_mirror;
+        active_linear_state_source_slots_ = &src_mirror;
+        active_linear_state_destination_slots_ = &dst_mirror;
         active_sequence_batch_ = batch;
         active_sequence_width_ = 1;
         ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
 
-        Tensor x = mirrors.x;
+        Tensor x = mirrors.x.slice(1, 0, batch).view({kCfg.hidden, batch});
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
-        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, mirrors.hidden, active_ctx_->stream);
-        ops::linear(mirrors.hidden, *lm_head_, mirrors.logits, active_ctx_->stream);
+        Tensor hidden_mirror = mirrors.hidden.slice(1, 0, batch).view({kCfg.hidden, batch});
+        Tensor logits_mirror = mirrors.logits.slice(1, 0, batch).view({kCfg.vocab, batch});
+        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden_mirror, active_ctx_->stream);
+        ops::linear(hidden_mirror, *lm_head_, logits_mirror, active_ctx_->stream);
         PipelineTransport& back = *pipeline_exec_->backward[active_stage_ - 1];
-        back.enqueue_stage_out(mirrors.hidden.data, mirrors.hidden.bytes(), 0);
-        back.enqueue_stage_out(mirrors.logits.data, mirrors.logits.bytes(), 1);
+        back.enqueue_stage_out(hidden_mirror.data, hidden_mirror.bytes(), 0);
+        back.enqueue_stage_out(logits_mirror.data, logits_mirror.bytes(), 1);
         finish_round();
     }
     graph_segment_ = -1;

@@ -40,6 +40,9 @@ struct PipelineStageResources {
     // path executes the primary fold and every stage fold together.
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
+    // Captured-graph mirrors live outside the resettable round workspace: their addresses are
+    // baked into graph nodes and must never share memory with per-round temporaries.
+    std::unique_ptr<DeviceArena> graph_mirrors;
 };
 
 // Cross-stage activation channel set: one forward and one backward transport per stage boundary.
@@ -53,6 +56,7 @@ struct OrdinaryGraphMirrors {
     Tensor kv_rows;
     Tensor src_slots;
     Tensor dst_slots;
+    Tensor valid;   // MTP verify valid columns
     Tensor sampling;
     Tensor x;       // boundary hidden mirror
     Tensor hidden;  // final-norm output mirror

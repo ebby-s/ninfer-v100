@@ -1048,7 +1048,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         const std::size_t slot_bytes =
             std::max<std::size_t>(static_cast<std::size_t>(prefill_chunk) * TextConfig::hidden * 2,
                                   std::size_t{1} << 20);
-        constexpr std::size_t kRoundSlots = 8;
+        constexpr std::size_t kRoundSlots = 12;
         for (int boundary = 0; boundary + 1 < pipeline->stage_count(); ++boundary) {
             pipeline_execution->forward.push_back(std::make_unique<PipelineTransport>(
                 pipeline->stage_device(boundary), pipeline->stage_device(boundary + 1),
@@ -11494,7 +11494,49 @@ void ProgramImplCore::prepare_graphs() {
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp && pipeline_execution != nullptr) {
-        // Pipeline MTP rounds run eagerly until their per-stage capture lands.
+        const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
+        validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+        schedule::MtpBatchContext mtp_state{execution_core(&*replay_records),
+                                            decoder->text_kv,
+                                            *mtp_round_cache(),
+                                            *io.mtp_decode,
+                                            *mtp_host_ingress,
+                                            *mtp_host_egress,
+                                            state_images->continuation_hidden_store()};
+        const GraphExecutionProfile code_warm = planned_profiles.front();
+        prepare_representative(code_warm.min, 1);
+        device.synchronize();
+        schedule::prepare_ordinary_graph_mirrors(*pipeline_execution);
+        schedule::mtp_decode_batch(
+            mtp_state, 1, draft_window, draft_window,
+            mtp_causal_attention_envelopes(code_warm.max, draft_window, draft_window, capacity),
+            nullptr);
+        device.synchronize();
+
+        pipeline_mtp_graphs0.profiles.reserve(planned_profiles.size() * max_concurrency);
+        pipeline_mtp_graphs1.profiles.reserve(planned_profiles.size() * max_concurrency);
+        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+            for (const GraphExecutionProfile planned : planned_profiles) {
+                pipeline_mtp_graphs0.profiles.emplace_back();
+                DecodeGraphProfile& profile0 = pipeline_mtp_graphs0.profiles.back();
+                profile0.batch_size             = batch_size;
+                profile0.min_execution_frontier = planned.min;
+                profile0.max_execution_frontier = planned.max;
+                profile0.topology_class =
+                    planned.topology_class * max_concurrency + (batch_size - 1U);
+                pipeline_mtp_graphs1.profiles.emplace_back();
+                DecodeGraphProfile& profile1 = pipeline_mtp_graphs1.profiles.back();
+                profile1.batch_size             = batch_size;
+                profile1.min_execution_frontier = planned.min;
+                profile1.max_execution_frontier = planned.max;
+                profile1.topology_class         = profile0.topology_class;
+                schedule::capture_mtp_decode_graphs(
+                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window, draft_window,
+                    mtp_causal_attention_envelopes(planned.max, draft_window, draft_window,
+                                                   capacity),
+                    profile0.definition, profile1.definition);
+            }
+        }
     } else if (speculative_backend == SpeculativeBackend::Mtp) {
         const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
@@ -11622,6 +11664,14 @@ void ProgramImplCore::prepare_graphs() {
         DeviceContext& last_stage =
             pipeline_execution->stage_device(pipeline_execution->stage_count() - 1);
         instantiate_graph_family(pipeline_ordinary_graphs1, "ordinary stage1", last_stage,
+                                 prepare_representative);
+    }
+    if (pipeline_execution != nullptr && !pipeline_mtp_graphs0.profiles.empty()) {
+        instantiate_graph_family(pipeline_mtp_graphs0, "MTP stage0", device,
+                                 prepare_representative);
+        DeviceContext& last_stage_mtp =
+            pipeline_execution->stage_device(pipeline_execution->stage_count() - 1);
+        instantiate_graph_family(pipeline_mtp_graphs1, "MTP stage1", last_stage_mtp,
                                  prepare_representative);
     }
     if (false) {
@@ -12332,9 +12382,23 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
+        DecodeGraphExecutable* stage1_executable = nullptr;
         schedule::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, verify_k, proposal_k, capacity);
-        if (use_cuda_graph && pipeline_execution == nullptr) {
+        if (use_cuda_graph && pipeline_execution != nullptr) {
+            DecodeGraphProfile& profile0 = select_graph_profile(
+                pipeline_mtp_graphs0, static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
+                "MTP batch stage0");
+            DecodeGraphProfile& profile1 = select_graph_profile(
+                pipeline_mtp_graphs1, static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
+                "MTP batch stage1");
+            executable        = &install_graph_profile(pipeline_mtp_graphs0, profile0,
+                                                       "MTP batch stage0");
+            stage1_executable = &install_graph_profile(pipeline_mtp_graphs1, profile1,
+                                                       "MTP batch stage1");
+            envelopes = mtp_causal_attention_envelopes(
+                profile0.max_execution_frontier, verify_k, proposal_k, capacity);
+        } else if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
@@ -12404,7 +12468,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                   verify_k, proposal_k, envelopes, executable);
+                                   verify_k, proposal_k, envelopes, executable,
+                                   stage1_executable);
         submit_range.reset();
         timing.begin_wait();
         {

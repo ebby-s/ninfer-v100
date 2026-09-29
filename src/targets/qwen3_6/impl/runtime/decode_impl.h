@@ -52,20 +52,31 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 } // namespace
 
-// Prepares the fixed last-stage graph mirrors once, from the last stage's workspace.
-void prepare_ordinary_graph_mirrors(OrdinaryBatchContext& state, std::int32_t batch_size) {
-    qwen3_6::PipelineExecution& pipeline = *state.execution.pipeline_execution;
+// Prepares the fixed last-stage graph mirrors once, from the last stage's workspace. Control
+// mirrors cover the maximum concurrency; activation mirrors cover the largest round (a verify
+// round batches up to (draft window + 1) columns per row). Captured graphs view them per round
+// with the exact round shape.
+void prepare_ordinary_graph_mirrors(qwen3_6::PipelineExecution& pipeline) {
     qwen3_6::OrdinaryGraphMirrors& mirrors = pipeline.ordinary_mirrors;
     if (mirrors.prepared) { return; }
-    WorkspaceArena& work = pipeline.stage_workspace(pipeline.stage_count() - 1);
-    mirrors.cache = work.alloc(DType::I32, {batch_size});
-    mirrors.rope = work.alloc(DType::I32, {batch_size});
-    mirrors.kv_rows = work.alloc(DType::I32, {batch_size});
-    mirrors.src_slots = work.alloc(DType::I32, {batch_size});
-    mirrors.dst_slots = work.alloc(DType::I32, {batch_size});
-    mirrors.x = work.alloc(DType::BF16, {TextConfig::hidden, batch_size});
-    mirrors.hidden = work.alloc(DType::BF16, {TextConfig::hidden, batch_size});
-    mirrors.logits = work.alloc(DType::BF16, {TextConfig::output_rows, batch_size});
+    qwen3_6::PipelineStageResources& resources = pipeline.stage_resources(pipeline.stage_count() - 1);
+    if (resources.graph_mirrors == nullptr) {
+        DeviceContext& last_device = pipeline.stage_device(pipeline.stage_count() - 1);
+        last_device.bind_to_current_thread();
+        resources.graph_mirrors = std::make_unique<DeviceArena>(std::size_t{16} << 20);
+    }
+    WorkspaceArena& work = *resources.graph_mirrors;
+    const std::int32_t rows = static_cast<std::int32_t>(kMaximumConcurrency);
+    mirrors.cache = work.alloc(DType::I32, {rows});
+    mirrors.rope = work.alloc(DType::I32, {rows});
+    mirrors.kv_rows = work.alloc(DType::I32, {rows});
+    mirrors.src_slots = work.alloc(DType::I32, {rows});
+    mirrors.dst_slots = work.alloc(DType::I32, {rows});
+    mirrors.valid = work.alloc(DType::I32, {rows});
+    const std::int32_t max_tokens = rows * (static_cast<std::int32_t>(kMtpLookupMaximumDrafts) + 1);
+    mirrors.x = work.alloc(DType::BF16, {TextConfig::hidden, max_tokens});
+    mirrors.hidden = work.alloc(DType::BF16, {TextConfig::hidden, rows});
+    mirrors.logits = work.alloc(DType::BF16, {TextConfig::output_rows, rows});
     mirrors.prepared = true;
 }
 
@@ -79,8 +90,8 @@ void capture_ordinary_decode_graphs(OrdinaryBatchContext& state, std::int32_t ba
                                     ops::CausalAttentionExecutionEnvelope envelope,
                                     DecodeGraphDefinition& definition0,
                                     DecodeGraphDefinition& definition1) {
-    prepare_ordinary_graph_mirrors(state, batch_size);
     qwen3_6::PipelineExecution& pipeline = *state.execution.pipeline_execution;
+    prepare_ordinary_graph_mirrors(pipeline);
 
     auto ingress_upload = [&state] {
         CUDA_CHECK(cudaMemcpyAsync(state.execution.io.ordinary->ingress.data, &state.host_ingress,

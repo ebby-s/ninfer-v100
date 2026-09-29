@@ -209,6 +209,101 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
     };
 }
 
+// Acceptance and the draft phase on the last stage against the mirror frame. Shared by the eager
+// pipeline round and the captured stage-1 graph.
+static void mtp_last_stage_phase(MtpBatchContext& state, qwen3_6::MtpDecodeState& mirror,
+                                 TextContext& card, std::int32_t batch_size,
+                                 std::uint32_t verify_k, std::uint32_t proposal_k,
+                                 const MtpCausalAttentionEnvelopes& envelopes) {
+    qwen3_6::PipelineExecution& pipeline = *state.execution.pipeline_execution;
+    DeviceContext& stage1           = pipeline.stage_device(pipeline.stage_count() - 1);
+    WorkspaceArena& stage1_work     = pipeline.last_workspace();
+    const std::int32_t width        = static_cast<std::int32_t>(verify_k) + 1;
+    const std::int32_t ar_steps     = static_cast<std::int32_t>(std::max(proposal_k - 1U, 1U));
+
+    Tensor mirror_anchors      = mirror.anchors.slice(0, 0, batch_size);
+    Tensor mirror_frontiers    = mirror.base_frontiers.slice(0, 0, batch_size);
+    Tensor mirror_budgets      = mirror.remaining_budgets.slice(0, 0, batch_size);
+    Tensor mirror_extents      = mirror.current_extents.slice(0, 0, batch_size);
+    Tensor mirror_drafts       = mirror.current_drafts.slice(1, 0, batch_size);
+    Tensor mirror_rope_deltas  = mirror.rope_deltas.slice(0, 0, batch_size);
+    Tensor mirror_licensed     = mirror.licensed_tokens.slice(1, 0, batch_size);
+    Tensor mirror_licensed_cnt = mirror.licensed_counts.slice(0, 0, batch_size);
+    Tensor mirror_accepted     = mirror.accepted_drafts.slice(0, 0, batch_size);
+    Tensor mirror_next_extents = mirror.next_extents.slice(0, 0, batch_size);
+    Tensor mirror_selected     = mirror.target_continuation_hidden.slice(1, 0, batch_size);
+    const auto* mirror_sampling = mirror.sampling;
+    Tensor target_tokens        = mirror.target_argmax.slice(1, 0, batch_size);
+    Tensor target_logits        = mirror.target_logits.slice(2, 0, batch_size);
+    Tensor target_hidden        = mirror.target_hidden.slice(2, 0, batch_size);
+    {
+        nvtx::ScopedRange accept_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
+                                       static_cast<std::uint64_t>(width) * batch_size);
+        ops::speculative_accept_greedy_drafts(
+            target_tokens, target_logits, mirror_drafts, mirror_extents, mirror_frontiers,
+            mirror_anchors, mirror_licensed, mirror_licensed_cnt, mirror_accepted,
+            TextConfig::token_domain, mirror_sampling, stage1_work, stage1.stream);
+        ops::speculative_select_accepted_hidden(target_hidden, mirror_accepted, mirror_selected,
+                                                stage1.stream);
+    }
+
+    {
+        nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
+                                      static_cast<std::uint64_t>(proposal_k) * batch_size);
+        Tensor alignment_ids    = mirror.alignment_ids.slice(1, 0, batch_size);
+        Tensor alignment_hidden = mirror.alignment_hidden.slice(2, 0, batch_size);
+        Tensor ar_hidden        = mirror.ar_hidden.slice(1, 0, batch_size);
+        Tensor next_hidden      = mirror.next_hidden.slice(1, 0, batch_size);
+        Tensor ar_positions =
+            mirror.ar_positions.slice(0, 0, batch_size).slice(1, 0, ar_steps);
+        Tensor ar_rope_positions =
+            mirror.ar_rope_positions.slice(0, 0, batch_size).slice(1, 0, ar_steps);
+        Tensor ar_valid_columns =
+            mirror.ar_valid_columns.slice(0, 0, batch_size).slice(1, 0, ar_steps);
+        Tensor next_drafts      = mirror.next_drafts.slice(0, 0, batch_size);
+        Tensor proposal_logits  = mirror.proposal_logits.slice(1, 0, batch_size);
+        Tensor mtp_rows         = mirror.mtp_kv_table_rows.slice(0, 0, batch_size);
+
+        ops::mtp_prepare_next_round(mirror.verify_ids, mirror_anchors, mirror_accepted,
+                                    mirror_frontiers, mirror_budgets, mirror_licensed_cnt,
+                                    mirror_rope_deltas, mirror.alignment_ids, mirror.next_extents,
+                                    mirror.ar_positions, mirror.ar_rope_positions,
+                                    mirror.ar_valid_columns,
+                                    static_cast<std::int32_t>(proposal_k),
+                                    static_cast<std::int32_t>(state.text_cache.max_context()),
+                                    stage1.stream);
+        card.mtp_forward_decode_batch(
+            alignment_ids, target_hidden, mirror.target_positions.slice(1, 0, batch_size),
+            mirror.target_rope_positions.slice(1, 0, batch_size), mirror_licensed_cnt,
+            mtp_rows, envelopes.batch, alignment_hidden);
+        ops::speculative_select_accepted_hidden(alignment_hidden, mirror_accepted, ar_hidden,
+                                                stage1.stream);
+
+        Tensor draft0 = mirror.next_drafts.slice(1, 0, 1).view({batch_size});
+        card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+        for (std::uint32_t step = 0; step + 1 < proposal_k; ++step) {
+            Tensor previous =
+                next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
+            Tensor next =
+                next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1).view({batch_size});
+            Tensor position =
+                ar_positions.slice(1, static_cast<std::int32_t>(step), 1).view({1, batch_size});
+            Tensor rope = ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
+                              .view({1, batch_size});
+            Tensor valid = ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
+                               .view({batch_size});
+            Tensor previous_batch    = previous.view({1, batch_size});
+            Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
+            Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
+            card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
+                                          mtp_rows, envelopes.ar[step], next_hidden_batch);
+            card.mtp_propose_batch(next_hidden, proposal_logits, next);
+            CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
+                                       cudaMemcpyDeviceToDevice, stage1.stream));
+        }
+    }
+}
+
 // Pipeline variant of one MTP round. The primary side uploads the ingress and prepares the
 // verify inputs; the verify traversal crosses to the last stage (its tail writes stage-local
 // mirror outputs); acceptance, the draft phase, and the proposal run entirely on the last stage
@@ -297,89 +392,9 @@ auto mtp_decode_batch_pipeline_body(MtpBatchContext& state, std::int32_t batch_s
                                  state_sources, envelopes.target_verify, mirror.target_hidden,
                                  mirror.target_logits, mirror.target_argmax);
 
-        // [last stage] acceptance against the mirror frame.
+        // [last stage] acceptance and the draft phase against the mirror frame.
         stage1.bind_to_current_thread();
-        Tensor mirror_anchors      = mirror.anchors.slice(0, 0, batch_size);
-        Tensor mirror_frontiers    = mirror.base_frontiers.slice(0, 0, batch_size);
-        Tensor mirror_budgets      = mirror.remaining_budgets.slice(0, 0, batch_size);
-        Tensor mirror_extents      = mirror.current_extents.slice(0, 0, batch_size);
-        Tensor mirror_drafts       = mirror.current_drafts.slice(1, 0, batch_size);
-        Tensor mirror_rope_deltas  = mirror.rope_deltas.slice(0, 0, batch_size);
-        Tensor mirror_licensed     = mirror.licensed_tokens.slice(1, 0, batch_size);
-        Tensor mirror_licensed_cnt = mirror.licensed_counts.slice(0, 0, batch_size);
-        Tensor mirror_accepted     = mirror.accepted_drafts.slice(0, 0, batch_size);
-        Tensor mirror_next_extents = mirror.next_extents.slice(0, 0, batch_size);
-        Tensor mirror_selected     = mirror.target_continuation_hidden.slice(1, 0, batch_size);
-        const auto* mirror_sampling = mirror.sampling;
-        Tensor target_tokens        = mirror.target_argmax.slice(1, 0, batch_size);
-        Tensor target_logits        = mirror.target_logits.slice(2, 0, batch_size);
-        Tensor target_hidden        = mirror.target_hidden.slice(2, 0, batch_size);
-        {
-            nvtx::ScopedRange accept_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
-                                           static_cast<std::uint64_t>(width) * batch_size);
-            ops::speculative_accept_greedy_drafts(
-                target_tokens, target_logits, mirror_drafts, mirror_extents, mirror_frontiers,
-                mirror_anchors, mirror_licensed, mirror_licensed_cnt, mirror_accepted,
-                TextConfig::token_domain, mirror_sampling, stage1_work, stage1.stream);
-            ops::speculative_select_accepted_hidden(target_hidden, mirror_accepted, mirror_selected,
-                                                    stage1.stream);
-        }
-
-        {
-            nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
-                                          static_cast<std::uint64_t>(proposal_k) * batch_size);
-            Tensor alignment_ids    = mirror.alignment_ids.slice(1, 0, batch_size);
-            Tensor alignment_hidden = mirror.alignment_hidden.slice(2, 0, batch_size);
-            Tensor ar_hidden        = mirror.ar_hidden.slice(1, 0, batch_size);
-            Tensor next_hidden      = mirror.next_hidden.slice(1, 0, batch_size);
-            Tensor ar_positions =
-                mirror.ar_positions.slice(0, 0, batch_size).slice(1, 0, ar_steps);
-            Tensor ar_rope_positions =
-                mirror.ar_rope_positions.slice(0, 0, batch_size).slice(1, 0, ar_steps);
-            Tensor ar_valid_columns =
-                mirror.ar_valid_columns.slice(0, 0, batch_size).slice(1, 0, ar_steps);
-            Tensor next_drafts      = mirror.next_drafts.slice(0, 0, batch_size);
-            Tensor proposal_logits  = mirror.proposal_logits.slice(1, 0, batch_size);
-            Tensor mtp_rows         = mirror.mtp_kv_table_rows.slice(0, 0, batch_size);
-
-            ops::mtp_prepare_next_round(mirror.verify_ids, mirror_anchors, mirror_accepted,
-                                        mirror_frontiers, mirror_budgets, mirror_licensed_cnt,
-                                        mirror_rope_deltas, mirror.alignment_ids, mirror.next_extents,
-                                        mirror.ar_positions, mirror.ar_rope_positions,
-                                        mirror.ar_valid_columns,
-                                        static_cast<std::int32_t>(proposal_k),
-                                        static_cast<std::int32_t>(state.text_cache.max_context()),
-                                        stage1.stream);
-            card.mtp_forward_decode_batch(
-                alignment_ids, target_hidden, mirror.target_positions.slice(1, 0, batch_size),
-                mirror.target_rope_positions.slice(1, 0, batch_size), mirror_licensed_cnt,
-                mtp_rows, envelopes.batch, alignment_hidden);
-            ops::speculative_select_accepted_hidden(alignment_hidden, mirror_accepted, ar_hidden,
-                                                    stage1.stream);
-
-            Tensor draft0 = mirror.next_drafts.slice(1, 0, 1).view({batch_size});
-            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
-            for (std::uint32_t step = 0; step + 1 < proposal_k; ++step) {
-                Tensor previous =
-                    next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
-                Tensor next =
-                    next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1).view({batch_size});
-                Tensor position =
-                    ar_positions.slice(1, static_cast<std::int32_t>(step), 1).view({1, batch_size});
-                Tensor rope = ar_rope_positions.slice(1, static_cast<std::int32_t>(step), 1)
-                                  .view({1, batch_size});
-                Tensor valid = ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1)
-                                   .view({batch_size});
-                Tensor previous_batch    = previous.view({1, batch_size});
-                Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
-                Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
-                card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              mtp_rows, envelopes.ar[step], next_hidden_batch);
-                card.mtp_propose_batch(next_hidden, proposal_logits, next);
-                CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice, stage1.stream));
-            }
-        }
+        mtp_last_stage_phase(state, mirror, card, batch_size, verify_k, proposal_k, envelopes);
 
         // [return] ship the egress region and the selected continuation rows, then finish the
         // round on the primary: continuation scatter and the host-visible egress transfer.
@@ -397,6 +412,144 @@ auto mtp_decode_batch_pipeline_body(MtpBatchContext& state, std::int32_t batch_s
     };
 }
 
+void capture_mtp_decode_graphs(MtpBatchContext& state, std::int32_t batch_size,
+                               std::uint32_t verify_k, std::uint32_t proposal_k,
+                               MtpCausalAttentionEnvelopes envelopes,
+                               DecodeGraphDefinition& definition0,
+                               DecodeGraphDefinition& definition1) {
+    if (state.execution.pipeline_execution == nullptr) {
+        throw std::logic_error("pipeline MTP graph capture requires a pipeline");
+    }
+    qwen3_6::PipelineExecution& pipeline = *state.execution.pipeline_execution;
+    const int last_stage                 = pipeline.stage_count() - 1;
+    qwen3_6::PipelineStageResources& resources = pipeline.stage_resources(last_stage);
+    if (!resources.mtp_frame) { throw std::logic_error("pipeline stage has no MTP frame"); }
+    qwen3_6::MtpDecodeState& frame  = state.frame;
+    qwen3_6::MtpDecodeState& mirror = *resources.mtp_frame;
+    DeviceContext& stage0           = state.execution.device;
+    DeviceContext& stage1           = pipeline.stage_device(last_stage);
+    PipelineTransport& forward      = *pipeline.forward[last_stage - 1];
+    PipelineTransport& backward     = *pipeline.backward[last_stage - 1];
+    if (pipeline.mtp_rope_delta.data == nullptr) {
+        stage1.bind_to_current_thread();
+        pipeline.mtp_rope_delta =
+            pipeline.last_workspace().alloc(DType::I32, {static_cast<std::int32_t>(kMaximumConcurrency)});
+    }
+
+    stage0.bind_to_current_thread();
+    definition0.capture(stage0.stream, [&] {
+        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
+                                   sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
+                                   stage0.stream));
+        Tensor verify_ids       = frame.verify_ids.slice(1, 0, batch_size);
+        Tensor target_positions = frame.target_positions.slice(1, 0, batch_size);
+        Tensor target_rope      = frame.target_rope_positions.slice(1, 0, batch_size);
+        Tensor target_valid     = frame.target_valid_columns.slice(0, 0, batch_size);
+        Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor state_sources    = frame.state_source_slots.slice(0, 0, batch_size);
+        Tensor current_drafts   = frame.current_drafts.slice(1, 0, batch_size);
+        Tensor anchors          = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers        = frame.base_frontiers.slice(0, 0, batch_size);
+        Tensor current_extents  = frame.current_extents.slice(0, 0, batch_size);
+        ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
+                                               verify_ids, target_positions, stage0.stream);
+        forward.enqueue_stage_out(frame.ingress.data, sizeof(qwen3_6::MtpDecodeIngress), 7);
+        forward.enqueue_stage_out(frame.verify_ids.data, frame.verify_ids.bytes(), 8);
+        forward.enqueue_stage_out(frame.target_positions.data, frame.target_positions.bytes(), 9);
+        forward.enqueue_stage_out(state.execution.io.rope_delta.data, pipeline.mtp_rope_delta.bytes(),
+                                  10);
+        TextContext card(stage0, state.execution.model, state.execution.work, {},
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         &state.text_cache, &state.mtp_cache, state.execution.pipeline_execution);
+        card.set_gdn_state_action(GdnStateAction::RecordForReplay, state.execution.replay_records);
+        card.target_verify_graph_segment(0, verify_ids, target_positions, target_rope, target_valid,
+                                         text_rows, state_sources, envelopes.target_verify,
+                                         mirror.target_hidden, mirror.target_logits,
+                                         mirror.target_argmax);
+    });
+
+    stage1.bind_to_current_thread();
+    definition1.capture(stage1.stream, [&] {
+        forward.enqueue_stage_in(mirror.ingress.data, sizeof(qwen3_6::MtpDecodeIngress), 7);
+        forward.enqueue_stage_in(mirror.verify_ids.data, frame.verify_ids.bytes(), 8);
+        forward.enqueue_stage_in(mirror.target_positions.data, frame.target_positions.bytes(), 9);
+        forward.enqueue_stage_in(pipeline.mtp_rope_delta.data, pipeline.mtp_rope_delta.bytes(), 10);
+        for (int row = 0; row < batch_size; ++row) {
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<std::byte*>(mirror.ingress.data) +
+                    offsetof(qwen3_6::MtpDecodeIngress, sampling) +
+                    static_cast<std::size_t>(row) * sizeof(ops::SamplingConfig) +
+                    offsetof(ops::SamplingConfig, token_counts),
+                0, sizeof(std::int32_t*), stage1.stream));
+        }
+        Tensor verify_ids       = frame.verify_ids.slice(1, 0, batch_size);
+        Tensor target_positions = frame.target_positions.slice(1, 0, batch_size);
+        Tensor target_rope      = frame.target_rope_positions.slice(1, 0, batch_size);
+        Tensor target_valid     = frame.target_valid_columns.slice(0, 0, batch_size);
+        Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor state_sources    = frame.state_source_slots.slice(0, 0, batch_size);
+        TextContext card(stage0, state.execution.model, state.execution.work, {},
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         &state.text_cache, &state.mtp_cache, state.execution.pipeline_execution);
+        card.set_gdn_state_action(GdnStateAction::RecordForReplay, state.execution.replay_records);
+        card.target_verify_graph_segment(1, verify_ids, target_positions, target_rope, target_valid,
+                                         text_rows, state_sources, envelopes.target_verify,
+                                         mirror.target_hidden, mirror.target_logits,
+                                         mirror.target_argmax);
+        mtp_last_stage_phase(state, mirror, card, batch_size, verify_k, proposal_k, envelopes);
+        backward.enqueue_stage_out(mirror.egress.data, sizeof(qwen3_6::MtpDecodeEgress), 0);
+        backward.enqueue_stage_out(mirror.target_continuation_hidden.data,
+                                   frame.target_continuation_hidden.bytes(), 1);
+    });
+    stage0.bind_to_current_thread();
+}
+
+void mtp_decode_graph_round(MtpBatchContext& state, std::int32_t batch_size,
+                            std::uint32_t verify_k, std::uint32_t proposal_k,
+                            MtpCausalAttentionEnvelopes envelopes,
+                            DecodeGraphExecutable* executable0,
+                            DecodeGraphExecutable* executable1) {
+    (void)verify_k;
+    (void)proposal_k;
+    (void)envelopes;
+    qwen3_6::PipelineExecution& pipeline = *state.execution.pipeline_execution;
+    const int last_stage                 = pipeline.stage_count() - 1;
+    qwen3_6::MtpDecodeState& frame       = state.frame;
+    qwen3_6::PipelineStageResources& resources = pipeline.stage_resources(last_stage);
+    qwen3_6::MtpDecodeState& mirror      = *resources.mtp_frame;
+    DeviceContext& stage0                = state.execution.device;
+    DeviceContext& stage1                = pipeline.stage_device(last_stage);
+    PipelineTransport& backward          = *pipeline.backward[last_stage - 1];
+    if (pipeline.ordinary_round_events[0] == nullptr) {
+        stage0.bind_to_current_thread();
+        CUDA_CHECK(cudaEventCreateWithFlags(&pipeline.ordinary_round_events[0],
+                                            cudaEventDisableTiming));
+        stage1.bind_to_current_thread();
+        CUDA_CHECK(cudaEventCreateWithFlags(&pipeline.ordinary_round_events[1],
+                                            cudaEventDisableTiming));
+    }
+    executable0->launch(stage0.stream);
+    stage0.bind_to_current_thread();
+    CUDA_CHECK(cudaEventRecord(pipeline.ordinary_round_events[0], stage0.stream));
+    stage1.bind_to_current_thread();
+    CUDA_CHECK(cudaStreamWaitEvent(stage1.stream, pipeline.ordinary_round_events[0], 0));
+    executable1->launch(stage1.stream);
+    CUDA_CHECK(cudaEventRecord(pipeline.ordinary_round_events[1], stage1.stream));
+    stage0.bind_to_current_thread();
+    CUDA_CHECK(cudaStreamWaitEvent(stage0.stream, pipeline.ordinary_round_events[1], 0));
+    backward.enqueue_stage_in(frame.egress.data, sizeof(qwen3_6::MtpDecodeEgress), 0);
+    backward.enqueue_stage_in(frame.target_continuation_hidden.data,
+                              frame.target_continuation_hidden.bytes(), 1);
+    ops::scatter(frame.target_continuation_hidden.slice(1, 0, batch_size),
+                 frame.state_destination_slots.slice(0, 0, batch_size),
+                 state.continuation_hidden_store, stage0.stream);
+    CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
+                               sizeof(qwen3_6::MtpDecodeEgress), cudaMemcpyDeviceToHost,
+                               stage0.stream));
+}
+
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
                               std::uint32_t verify_k, std::uint32_t proposal_k,
                               MtpCausalAttentionEnvelopes envelopes,
@@ -410,8 +563,14 @@ void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
                       std::uint32_t verify_k, std::uint32_t proposal_k,
-                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
+                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable,
+                      DecodeGraphExecutable* executable1) {
     if (state.execution.pipeline_execution != nullptr) {
+        if (executable != nullptr && executable1 != nullptr) {
+            mtp_decode_graph_round(state, batch_size, verify_k, proposal_k, envelopes, executable,
+                                   executable1);
+            return;
+        }
         auto body =
             mtp_decode_batch_pipeline_body(state, batch_size, verify_k, proposal_k, envelopes);
         body();

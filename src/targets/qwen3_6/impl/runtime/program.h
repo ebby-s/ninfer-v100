@@ -679,6 +679,8 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily pipeline_ordinary_graphs0;
     DecodeGraphFamily pipeline_ordinary_graphs1;
+    DecodeGraphFamily pipeline_mtp_graphs0;
+    DecodeGraphFamily pipeline_mtp_graphs1;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily mtp_lookup_graphs;
     DecodeGraphFamily dflash_graphs;

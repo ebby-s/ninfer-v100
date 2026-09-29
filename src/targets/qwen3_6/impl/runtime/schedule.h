@@ -175,13 +175,25 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
 // different current and next proposal extent while the model traversal remains batched.
+// Pipeline variant: two per-stage graphs per round, chained by events with an eager stage-0 tail.
+void capture_mtp_decode_graphs(MtpBatchContext& state, std::int32_t batch_size,
+                               std::uint32_t verify_k, std::uint32_t proposal_k,
+                               MtpCausalAttentionEnvelopes envelopes,
+                               DecodeGraphDefinition& definition0,
+                               DecodeGraphDefinition& definition1);
+void mtp_decode_graph_round(MtpBatchContext& state, std::int32_t batch_size,
+                            std::uint32_t verify_k, std::uint32_t proposal_k,
+                            MtpCausalAttentionEnvelopes envelopes,
+                            DecodeGraphExecutable* executable0,
+                            DecodeGraphExecutable* executable1);
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
                               std::uint32_t verify_k, std::uint32_t proposal_k,
                               MtpCausalAttentionEnvelopes envelopes,
                               DecodeGraphDefinition& definition);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
                       std::uint32_t verify_k, std::uint32_t proposal_k,
-                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable);
+                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable,
+                      DecodeGraphExecutable* executable1 = nullptr);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
